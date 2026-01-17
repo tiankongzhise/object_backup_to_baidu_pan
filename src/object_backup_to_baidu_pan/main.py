@@ -10,7 +10,7 @@ from pathlib import Path
 
 def run_gui():
     """运行图形界面"""
-    from ui import MainWindow
+    from .ui import MainWindow
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
@@ -62,6 +62,7 @@ def run_cli(config_path: str):
 
 def main():
     """主函数"""
+    print("main is run!")
     parser = argparse.ArgumentParser(description="百度网盘备份工具")
     parser.add_argument(
         '--gui', action='store_true',

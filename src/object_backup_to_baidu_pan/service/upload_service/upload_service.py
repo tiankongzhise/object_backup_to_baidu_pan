@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import re
 from dotenv import load_dotenv
 import hashlib
 from pprint import pprint
@@ -31,14 +32,35 @@ class UploadService:
         load_dotenv(env_path)
 
     def _set_remote_path(self):
-        temp_path = '/item_backup/'
+        """设置远程路径，格式遵循PRD规范:
+        {百度云盘指定目录}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
+        """
+        # 从本地ZIP路径提取日期和密码
         date, password = extract_date_and_password_from_path(self.file_path.absolute().as_posix())
-        date = date or datetime.now().strftime("%Y%m%d") 
+        date = date or datetime.now().strftime("%Y%m%d")
+
         if not password:
-            print(f"upload info Password is missing, please check your file path:{self.file_path},use unknown instead")
-        password = password or "unknown"
-        temp_path = f"{temp_path}{date}/{password}/{self.file_path.name}"
-        self.remote_path = temp_path
+            print(f"upload info Password is missing, please check your file path:{self.file_path}, use unknown instead")
+            password = "unknown"
+
+        # 从本地路径提取源文件夹名
+        # 本地路径格式: {compress_dir}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
+        path_parts = self.file_path.parent.parts
+        source_folder_name = None
+        for part in reversed(path_parts):
+            # 跳过日期和压缩根目录，找到源文件夹名
+            if re.match(r'^\d{8}$', part):
+                continue
+            if part == 'item_backup' or part == 'compress':
+                continue
+            source_folder_name = part
+            break
+
+        if not source_folder_name:
+            source_folder_name = "unknown"
+
+        # 构建远程路径: /item_backup/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
+        self.remote_path = f"/item_backup/{date}/{source_folder_name}/解压密码_{password}/{self.file_path.name}"
 
     def _split_file(self):
         '''

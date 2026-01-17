@@ -15,7 +15,7 @@ class ManualReviewItem(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
     # 文件路径信息
-    file_path = Column(String(1024), nullable=False, unique=True)
+    file_path = Column(String(500), nullable=False, unique=True)
     file_size = Column(BigInteger, nullable=True)
     file_count = Column(BigInteger, nullable=True)
 
@@ -26,7 +26,7 @@ class ManualReviewItem(Base):
     status = Column(String(20), default='pending', nullable=False)
 
     # 备注
-    notes = Column(String(1024), nullable=True)
+    notes = Column(String(500), nullable=True)
 
     # 时间戳
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

@@ -8,7 +8,7 @@ from typing import Union, Optional
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
-from .classify_service import FileInfo, FolderInfo, ManualReviewItem, ClassifyResult
+from .classify_service import FileInfo, FolderInfo, ManualReviewItem, ClassifyResult, ScanResult
 from .hash_service import CalculateHashService
 from ..config import HashConfig
 from ..models import SourceFile
@@ -69,8 +69,12 @@ class DedupeService:
                     self.hash_config.required_hash_algorithms
                 )
             else:
+                # 传递FolderInfo对象（字典形式），避免folder_hash重复检查分类条件
                 hashes = CalculateHashService.calculate_folder_hash(
-                    item.source_path,
+                    {
+                        'source_path': str(item.source_path),
+                        'classify_result': item.classify_result.value
+                    },
                     self.hash_config.required_hash_algorithms
                 )
 
@@ -189,6 +193,3 @@ class DedupeService:
             from datetime import datetime
             existing.backup_time = datetime.utcnow()
 
-
-# 导入ScanResult类型
-from .classify_service import ScanResult

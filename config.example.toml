@@ -4,17 +4,17 @@
 
 # ==================== 源文件夹配置 ====================
 [source]
-# 需要备份的源文件夹路径
-path = "D:/测试用例"
+# 需要备份的源文件夹路径（Windows路径使用双反斜杠）
+path = "d:\\测试用例"
 # ZIP压缩包密码（可选，建议在 .env 中通过环境变量配置更安全）
 password = ""
 
 # ==================== 存储路径配置 ====================
 [storage]
 # 压缩文件存放目录
-compress_dir = "D:/backup_compress"
+compress_dir = "d:\\backup_compress"
 # 解压验证临时目录
-extract_dir = "D:/backup_extract"
+extract_dir = "d:\\backup_extract"
 # 磁盘使用限制（GB），超过此限制将暂停处理
 disk_limit_gb = 80
 

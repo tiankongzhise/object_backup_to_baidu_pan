@@ -45,6 +45,10 @@ class BackupWorker(QThread):
                 pool_config=self.pool_config
             )
 
+            # 设置回调，将进度和日志传递到UI
+            orchestrator.config.on_progress = self.progress_updated.emit
+            orchestrator.config.on_log = self.log_message.emit
+
             orchestrator.run()
 
             self.finished.emit(True, "备份完成")
@@ -392,6 +396,9 @@ class MainWindow(QMainWindow):
             self.source_path_edit.setText(path)
             self.config.source.path = Path(path)
             self._update_disk_space()
+            # 启用开始按钮
+            if self.config.source.path and self.config.source.path.exists():
+                self.start_btn.setEnabled(True)
 
     def _select_dir(self, line_edit: QLineEdit):
         """选择目录"""

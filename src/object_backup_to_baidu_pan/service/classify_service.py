@@ -48,7 +48,7 @@ class FolderInfo:
     """文件夹信息"""
     source_path: Path
     folder_name: str
-    file_count: int  # 直接子文件数
+    file_count: int  # 全部子文件数（递归统计）
     total_size: int
     classify_result: ClassifyResult = ClassifyResult.NORMAL_FOLDER
 
@@ -156,6 +156,26 @@ class ClassifyService:
             classify_result=ClassifyResult.NORMAL_FILE,
         )
 
+    def _count_all_files(self, folder_path: Path) -> tuple[int, int]:
+        """递归统计文件夹下所有文件的数量和总大小
+
+        Args:
+            folder_path: 文件夹路径
+
+        Returns:
+            tuple[int, int]: (文件数量, 总大小)
+        """
+        file_count = 0
+        total_size = 0
+        for child in folder_path.rglob('*'):  # 递归遍历所有文件和文件夹
+            if child.is_file():
+                file_count += 1
+                try:
+                    total_size += child.stat().st_size
+                except OSError:
+                    pass
+        return file_count, total_size
+
     def _classify_folder(self, folder_path: Path) -> FolderInfo | ManualReviewItem:
         """分类单个文件夹
 
@@ -165,17 +185,8 @@ class ClassifyService:
         Returns:
             FolderInfo | ManualReviewItem: 文件夹信息或人工审核项目
         """
-        # 计算直接子文件数和总大小
-        file_count = 0
-        total_size = 0
-
-        for child in folder_path.iterdir():
-            if child.is_file():
-                file_count += 1
-                try:
-                    total_size += child.stat().st_size
-                except OSError:
-                    pass
+        # 递归统计所有子文件的数量和总大小
+        file_count, total_size = self._count_all_files(folder_path)
 
         # 检查是否为空文件夹
         if file_count == 0:

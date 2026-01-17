@@ -14,7 +14,7 @@ class SourceFile(Base):
     __tablename__ = 'source_files'
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    file_path = Column(String(1024), unique=True, nullable=False, index=True)
+    file_path = Column(String(500), unique=True, nullable=False, index=True)
     file_name = Column(String(255), nullable=False)
     file_size = Column(BigInteger, nullable=False)
 

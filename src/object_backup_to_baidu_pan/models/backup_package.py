@@ -16,8 +16,8 @@ class BackupPackage(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
 
     # 文件路径
-    package_path = Column(String(1024), nullable=False, unique=True)
-    baidu_pan_path = Column(String(1024), nullable=True)
+    package_path = Column(String(500), nullable=False, unique=True)
+    baidu_pan_path = Column(String(500), nullable=True)
 
     # 关联源文件
     source_file_id = Column(BigInteger, ForeignKey('source_files.id'), nullable=True)

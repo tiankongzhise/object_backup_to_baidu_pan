@@ -28,9 +28,9 @@ def run_cli(config_path: str):
     Args:
         config_path: 配置文件路径
     """
-    from config import load_config
-    from service.database_service import DatabaseService
-    from service.orchestrator import MainOrchestrator
+    from .config import load_config, DatabaseCredentials
+    from .service.database_service import DatabaseService
+    from .service.orchestrator import MainOrchestrator
 
     # 加载配置
     config = load_config(config_path)
@@ -38,8 +38,9 @@ def run_cli(config_path: str):
         print("错误: 无法加载配置文件")
         sys.exit(1)
 
-    # 创建数据库服务
-    db_service = DatabaseService(config.database)
+    # 创建数据库服务（从环境变量读取凭证）
+    credentials = DatabaseCredentials()
+    db_service = DatabaseService(credentials, config.database)
 
     # 检查数据库连接
     if not db_service.check_connection():
@@ -47,7 +48,7 @@ def run_cli(config_path: str):
         sys.exit(1)
 
     # 创建协调器并运行
-    orchestrator = MainOrchestrator(config, db_service)
+    orchestrator = MainOrchestrator(config, credentials, config.database)
 
     try:
         orchestrator.run()

@@ -7,7 +7,7 @@
 
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Callable
 import os
 
 
@@ -30,9 +30,9 @@ class ClassifyConfig:
 class ZipConfig:
     """ZIP压缩配置"""
     salt: dict[int, bytes] = field(default_factory=lambda: {
-        4: b'1234',
-        8: b'12345678',
-        16: b'1234567890123456',
+        8: b"\xaa%\xec\xec[\x94\xbex",
+        12: b"}y\xd5\x19A\xa2\xf6\x1b\xce\x86\x7f\x85",
+        16: b"\xd1\x12_\xd7\xd7\n\x92\xfdC\x84\re\xcdxD\x0b",
     })
     salt_length: int = 16
     compress_level: int = 0  # 存储模式，不压缩
@@ -105,6 +105,9 @@ class Config:
     zip: ZipConfig = field(default_factory=ZipConfig)
     upload: UploadConfig = field(default_factory=UploadConfig)
     space: SpaceConfig = field(default_factory=SpaceConfig)
+    # 回调函数（不持久化）
+    on_progress: Callable = None
+    on_log: Callable = None
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Config':

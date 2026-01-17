@@ -1,6 +1,13 @@
 """主协调器
 
 协调整个备份流程，连接各个服务模块。
+
+流程说明：
+1. 文件扫描分类 → 标记人工处理项到DB，只处理正常项
+2. 去重比对 → 计算Hash，与DB比对
+3. 同步处理 → 压缩+验证
+4. 异步上传 → 上传到百度网盘
+5. 人工处理检查 → 流程结束后检查是否有pending的人工处理项，发送邮件通知
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +17,9 @@ from datetime import datetime
 import logging
 import shutil
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.utils import formataddr
 
 from ..config import Config, SpaceConfig, DatabaseCredentials, DatabasePoolConfig
 from .database_service import DatabaseService
@@ -23,7 +33,6 @@ from .zip_service import ZipService
 from .verify_service import VerifyService
 from .space_manager import SpaceManager
 from .queue_manager import QueueManager, UploadTask, UploadResult
-from .database_service import DatabaseService
 from ..models import (
     SourceFile, BackupPackage, ManualReviewItem as ManualReviewItemModel,
     OperationLog
@@ -108,17 +117,23 @@ class MainOrchestrator:
             # 2. 创建数据库表
             self.db_service.create_tables()
 
-            # 3. 扫描源文件夹
-            scan_results = self._scan_source()
+            # 3. 扫描源文件夹并进行分类
+            scan_results = self._scan_and_classify()
 
-            # 4. 去重比对
+            # 4. 保存人工处理项到数据库（只保存，不处理）
+            self._save_manual_review_items(scan_results)
+
+            # 5. 去重比对（只处理正常文件/文件夹，跳过ManualReviewItem）
             deduplicate_results = self._deduplicate(scan_results)
 
-            # 5. 同步处理（压缩+验证）
+            # 6. 同步处理（压缩+验证）
             upload_tasks = self._process_items(deduplicate_results)
 
-            # 6. 异步上传
+            # 7. 异步上传
             self._upload_tasks(upload_tasks)
+
+            # 8. 人工处理检查
+            self._check_manual_review_items()
 
             self._update_progress(
                 phase='completed',
@@ -162,19 +177,192 @@ class MainOrchestrator:
 
         return results
 
+    def _scan_and_classify(self) -> list[ScanResult]:
+        """扫描源文件夹并进行分类
+
+        流程：扫描 → 分类检查 → 分离正常项和需人工处理项
+
+        Returns:
+            list[ScanResult]: 分类后的结果列表
+        """
+        self._update_progress(
+            phase='scanning',
+            current_status='正在扫描并分类...'
+        )
+
+        source_path = self.config.source.path
+        self._log(f"扫描源文件夹: {source_path}")
+
+        results = self.classify_service.scan_source_folder(source_path)
+
+        # 统计
+        normal_count = sum(1 for r in results if isinstance(r, (FileInfo, FolderInfo)))
+        manual_count = sum(1 for r in results if isinstance(r, ManualReviewItem))
+
+        self._log(f"扫描完成: 正常项目 {normal_count}, 需人工处理 {manual_count}")
+
+        return results
+
+    def _save_manual_review_items(self, scan_results: list[ScanResult]):
+        """保存人工处理项到数据库
+
+        Args:
+            scan_results: 扫描分类结果
+        """
+        self._update_progress(
+            phase='saving_manual_review',
+            current_status='正在保存人工处理项...'
+        )
+
+        # 过滤出需要人工处理的项目
+        manual_items = [r for r in scan_results if isinstance(r, ManualReviewItem)]
+
+        if not manual_items:
+            self._log("无需人工处理的项目")
+            return
+
+        with self.db_service.get_session() as session:
+            for item in manual_items:
+                # 检查是否已存在
+                existing = session.query(ManualReviewItemModel).filter(
+                    ManualReviewItemModel.file_path == str(item.source_path)
+                ).first()
+
+                if existing:
+                    # 已存在，更新状态
+                    existing.status = 'pending'
+                    self._log(f"更新人工处理项: {item.source_path}")
+                else:
+                    # 新建记录
+                    review_item = ManualReviewItemModel(
+                        file_path=str(item.source_path),
+                        file_size=item.file_size,
+                        file_count=item.file_count,
+                        reason=item.reason,
+                        status='pending',
+                    )
+                    session.add(review_item)
+                    self._log(f"添加人工处理项: {item.source_path}, 原因: {item.reason}")
+
+        self._log(f"已保存 {len(manual_items)} 个人工处理项")
+
     def _deduplicate(self, scan_results: list[ScanResult]) -> DedupeResult:
-        """去重比对"""
+        """去重比对
+
+        注意：只对正常文件/文件夹进行去重，跳过ManualReviewItem
+
+        Args:
+            scan_results: 扫描分类结果
+
+        Returns:
+            DedupeResult: 去重结果
+        """
         self._update_progress(
             phase='deduplicating',
             current_status='正在比对去重...'
         )
 
+        # 过滤出正常文件/文件夹，跳过ManualReviewItem
+        normal_items = [
+            r for r in scan_results
+            if isinstance(r, (FileInfo, FolderInfo))
+        ]
+
+        if not normal_items:
+            self._log("没有需要处理的文件")
+            return DedupeResult(
+                to_backup=[],
+                already_backup=[],
+                not_found_in_db=[]
+            )
+
         with self.db_service.get_session() as session:
-            results = self.dedupe_service.compare_and_dedupe(scan_results, session)
+            results = self.dedupe_service.compare_and_dedupe(normal_items, session)
 
         self._log(f"去重完成: 待备份 {len(results.to_backup)}, 已备份 {len(results.already_backup)}")
 
         return results
+
+    def _check_manual_review_items(self):
+        """检查人工处理项并发送邮件通知"""
+        self._update_progress(
+            phase='checking_manual_review',
+            current_status='正在检查人工处理项...'
+        )
+
+        with self.db_service.get_session() as session:
+            # 查询状态为pending的人工处理项
+            pending_items = session.query(ManualReviewItemModel).filter(
+                ManualReviewItemModel.status == 'pending'
+            ).all()
+
+            if not pending_items:
+                self._log("没有待人工处理的项目")
+                return
+
+            # 有待处理项，发送邮件通知
+            self._send_manual_review_notification(pending_items)
+
+    def _send_manual_review_notification(self, pending_items: list[ManualReviewItemModel]):
+        """发送人工处理邮件通知
+
+        Args:
+            pending_items: 待处理的人工处理项列表
+        """
+        from ..config import SMTPCredentials
+
+        credentials = SMTPCredentials()
+
+        # 如果没有配置邮件，跳过
+        if not credentials.host or not credentials.username:
+            self._log("未配置邮件服务器，跳过人工处理通知")
+            return
+
+        # 构建邮件内容
+        items_html = ""
+        for item in pending_items:
+            items_html += f"""
+            <tr>
+                <td>{item.file_path}</td>
+                <td>{item.reason}</td>
+                <td>{item.file_size / (1024**3):.2f} GB</td>
+                <td>{item.file_count or '-'}</td>
+            </tr>
+            """
+
+        html_content = f"""
+        <html>
+        <body>
+            <h2>百度网盘备份系统 - 人工处理通知</h2>
+            <p>以下项目需要人工处理：</p>
+            <table border="1" cellpadding="5">
+                <tr>
+                    <th>文件路径</th>
+                    <th>原因</th>
+                    <th>大小</th>
+                    <th>文件数</th>
+                </tr>
+                {items_html}
+            </table>
+            <p>请登录系统处理这些项目。</p>
+        </body>
+        </html>
+        """
+
+        try:
+            msg = MIMEText(html_content, 'html', 'utf-8')
+            msg['Subject'] = f'备份系统人工处理通知 - {len(pending_items)}个项目待处理'
+            msg['From'] = formataddr(['备份系统', credentials.username])
+            msg['To'] = credentials.username  # 发送给管理员
+
+            with smtplib.SMTP_SSL(credentials.host, credentials.port) as server:
+                server.login(credentials.username, credentials.password)
+                server.send_message(msg)
+
+            self._log(f"已发送人工处理通知邮件，包含 {len(pending_items)} 个项目")
+
+        except Exception as e:
+            self._log(f"发送人工处理通知邮件失败: {e}")
 
     def _process_items(self, dedupe_results: DedupeResult) -> list[UploadTask]:
         """同步处理所有项目（压缩+验证）"""

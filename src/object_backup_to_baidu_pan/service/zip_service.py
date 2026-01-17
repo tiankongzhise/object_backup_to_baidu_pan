@@ -6,10 +6,10 @@ import datetime
 from ..config import ZipConfig
 
 
-
 def add_self_salt(self):
     self.salt = ZipConfig.salt[self.salt_length]
-    
+
+
 def _add_file_to_zip(zipf: pyzipper.ZipFile, file_path: pathlib.Path, arcname: str) -> None:
     """添加单个文件到ZIP压缩包"""
     zipf.write(file_path, arcname)
@@ -57,8 +57,8 @@ class ZipService:
         ziped_item.parent.mkdir(parents=True, exist_ok=True)
         
         compress_level = max(0, min(9, compress_level))
-        
-        with when(pyzipper.zipfile_aes.AESZipEncrypter,'pwd_verify_length = 2').do(add_self_salt):
+
+        with when(pyzipper.zipfile_aes.AESZipEncrypter, 'pwd_verify_length = 2').do(add_self_salt):
             try:
                 with pyzipper.AESZipFile(
                     ziped_item,

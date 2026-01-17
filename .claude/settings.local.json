@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(timeout 30 uv run run.py)"
+    ]
+  }
+}

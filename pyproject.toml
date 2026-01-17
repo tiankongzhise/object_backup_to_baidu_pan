@@ -34,3 +34,18 @@ python_functions = ["test_*"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/object_backup_to_baidu_pan"]
+
+
+[[tool.uv.index]]
+name = "tuna-mirro"
+url="https://pypi.tuna.tsinghua.edu.cn/simple"
+default=true
+
+[[tool.uv.index]]
+name = "ustc-mirro"
+url="https://pypi.mirrors.ustc.edu.cn/simple/"
+
+
+[[tool.uv.index]]
+name = "aliyun-mirro"
+url="http://mirrors.aliyun.com/pypi/simple/"

@@ -138,7 +138,7 @@ class ZipService:
             ...     compress_level=0
             ... )
             >>> print(zip_path)
-            /tmp/compress/20260118/解压密码_my_secure_password/folder.zip
+            /tmp/compress/20260118/folder/解压密码_my_secure_password/folder.zip
         """
         source_item = pathlib.Path(source_item)
         target_dir = pathlib.Path(target_dir)
@@ -152,13 +152,19 @@ class ZipService:
             raise TypeError(f"压缩级别应为整数，实际为: {type(compress_level)}")
 
         # 构建输出路径
+        # 路径格式: {target_dir}/YYYYMMDD/{source_name}/解压密码_{password}/{source_name}.zip
         date_str = datetime.datetime.now().strftime("%Y%m%d")
+        source_parent_name = source_item.parent.name
+
+        # 获取源文件夹名（父目录名）
+        # 如果源是文件，直接用文件名
+        # 如果源是文件夹，也用文件夹名
         if password:
-            # 带密码: {target_dir}/YYYYMMDD/解压密码_{password}/{source_item.name}.zip
-            ziped_item = target_dir / date_str / f'解压密码_{password}' / f'{source_item.name}.zip'
+            # 带密码: {target_dir}/YYYYMMDD/{source_name}/解压密码_{password}/{source_name}.zip
+            ziped_item = target_dir / date_str / source_parent_name / f'解压密码_{password}' / f'{source_item.name}.zip'
         else:
-            # 无密码: {target_dir}/YYYYMMDD/{source_item.name}.zip
-            ziped_item = target_dir / date_str / f'{source_item.name}.zip'
+            # 无密码: {target_dir}/YYYYMMDD/{source_name}/{source_name}.zip
+            ziped_item = target_dir / date_str / source_parent_name / f'{source_item.name}.zip'
 
         # 确保父目录存在
         ziped_item.parent.mkdir(parents=True, exist_ok=True)
@@ -206,6 +212,8 @@ class ZipService:
         """解压ZIP文件到目标目录
 
         解压使用WinZip AES加密的ZIP文件，支持密码验证。
+        路径格式遵循PRD规范:
+        {extract_dir}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{源文件夹名}
 
         Args:
             zip_path: ZIP文件路径
@@ -226,14 +234,16 @@ class ZipService:
         Example:
             >>> from service.zip_service import ZipService
             >>> extract_path = ZipService.unzip_item(
-            ...     zip_path='/tmp/compress/20260118/解压密码_pass/test.zip',
+            ...     zip_path='/tmp/compress/20260118/folder/解压密码_pass/folder.zip',
             ...     target_dir='/tmp/extract',
             ...     password='pass'
             ... )
             >>> print(extract_path)
-            /tmp/extract/test
+            /tmp/extract/20260118/folder/解压密码_pass/folder
         """
+        import re as re_module
         zip_path = pathlib.Path(zip_path)
+        print(f"解压ZIP文件: {zip_path}")
 
         if target_dir is None:
             target_dir = pathlib.Path(ZipConfig.unzip_folder)
@@ -243,25 +253,54 @@ class ZipService:
         if not zip_path.exists():
             raise FileNotFoundError(f"ZIP文件不存在: {zip_path}")
 
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # 从ZIP路径提取源文件夹名
+        # 路径格式: {xxx}/YYYYMMDD/{source_folder}/解压密码_xxx/{source_name}.zip
+        path_parts = zip_path.parent.parts
+        source_folder = None
+        date_str = None
+        for i, part in enumerate(path_parts):
+            # 检查是否是日期
+            if re_module.match(r'^\d{8}$', part):
+                date_str = part
+                # 源文件夹名在日期后面
+                if i + 1 < len(path_parts):
+                    source_folder = path_parts[i + 1]
+                break
+
+        if not source_folder:
+            # 回退: 使用ZIP文件名（不含扩展名）
+            source_folder = zip_path.stem
+            if source_folder.endswith('.zip'):
+                source_folder = source_folder[:-4]
+
+        # 构建目标路径: {target_dir}/YYYYMMDD/{source_name}/解压密码_{password}/{source_name}
+        if not date_str:
+            date_str = datetime.datetime.now().strftime("%Y%m%d")
+
+        if password:
+            extract_base = target_dir / date_str / source_folder / f'解压密码_{password}'
+        else:
+            extract_base = target_dir / date_str / source_folder
+
+        extract_to = extract_base / zip_path.stem
+
+
+        # 确保目标目录存在
+        extract_base.mkdir(parents=True, exist_ok=True)
 
         try:
             with pyzipper.AESZipFile(zip_path, 'r') as zipf:
                 if password:
                     zipf.setpassword(password.encode('utf-8'))
 
-                # 获取ZIP内的根目录名作为解压后的顶层目录
-                all_names = zipf.namelist()
-                if all_names:
-                    # 假设第一个文件所在的目录即为根目录
-                    root_prefix = all_names[0].split('/')[0]
-                    extract_to = target_dir / root_prefix
-                else:
-                    # 空ZIP则使用文件名作为根目录
-                    extract_to = target_dir / zip_path.stem
-
-                zipf.extractall(target_dir)
+                # 解压到目标目录
+                zipf.extractall(extract_base)
+                print(f"解压完成: {extract_to}")
                 return extract_to
 
         except Exception as e:
+            # 失败时清理目标目录
+            if extract_base.exists():
+                import shutil
+                shutil.rmtree(extract_base, ignore_errors=True)
             raise RuntimeError(f"解压失败: {e}")

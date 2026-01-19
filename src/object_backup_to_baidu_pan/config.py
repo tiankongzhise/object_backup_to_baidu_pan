@@ -237,10 +237,14 @@ class SMTPCredentials:
     """SMTP邮件凭证（从环境变量读取）"""
 
     def __init__(self):
-        self.host = get_env('SMTP_HOST', '')
+        # 支持多种环境变量名（SMTP_SERVER/SENDER_EMAIL等是用户配置的常见名称）
+        self.host = get_env('SMTP_HOST') or get_env('SMTP_SERVER', '')
         self.port = get_env_int('SMTP_PORT', 465)
-        self.username = get_env('SMTP_USER', '')
-        self.password = get_env('SMTP_PASSWORD', '')
+        self.username = get_env('SMTP_USER') or get_env('SENDER_EMAIL', '')
+        self.password = get_env('SMTP_PASSWORD') or get_env('SENDER_PASSWORD', '')
+        # 管理员邮箱列表（逗号分隔）
+        admin_emails = get_env('ADMIN_EMAILS', '')
+        self.admin_emails = [e.strip() for e in admin_emails.split(',') if e.strip()] if admin_emails else [self.username]
 
 
 __all__ = [

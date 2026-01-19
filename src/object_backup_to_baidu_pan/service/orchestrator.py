@@ -321,11 +321,12 @@ class MainOrchestrator:
         # 构建邮件内容
         items_html = ""
         for item in pending_items:
+            file_size_gb = (item.file_size / (1024**3)) if item.file_size else 0
             items_html += f"""
             <tr>
                 <td>{item.file_path}</td>
                 <td>{item.reason}</td>
-                <td>{item.file_size / (1024**3):.2f} GB</td>
+                <td>{file_size_gb:.2f} GB</td>
                 <td>{item.file_count or '-'}</td>
             </tr>
             """
@@ -353,13 +354,16 @@ class MainOrchestrator:
             msg = MIMEText(html_content, 'html', 'utf-8')
             msg['Subject'] = f'备份系统人工处理通知 - {len(pending_items)}个项目待处理'
             msg['From'] = formataddr(['备份系统', credentials.username])
-            msg['To'] = credentials.username  # 发送给管理员
+
+            # 发送给所有管理员
+            recipients = credentials.admin_emails
+            msg['To'] = ', '.join(recipients)
 
             with smtplib.SMTP_SSL(credentials.host, credentials.port) as server:
                 server.login(credentials.username, credentials.password)
-                server.send_message(msg)
+                server.send_message(msg, from_addr=credentials.username, to_addrs=recipients)
 
-            self._log(f"已发送人工处理通知邮件，包含 {len(pending_items)} 个项目")
+            self._log(f"已发送人工处理通知邮件给 {len(recipients)} 位管理员，包含 {len(pending_items)} 个项目")
 
         except Exception as e:
             self._log(f"发送人工处理通知邮件失败: {e}")
@@ -450,25 +454,43 @@ class MainOrchestrator:
         return True
 
     def _save_package_info(self, item: DedupeResultItem, zip_path: Path):
-        """保存压缩包信息到数据库"""
+        """保存压缩包信息到数据库
+
+        注意：SourceFile保存源文件的hash（用于去重），BackupPackage保存ZIP的hash（用于完整性验证）
+        """
         password = self.config.source.password or self.config.zip.default_password
 
-        # 计算ZIP Hash
+        # 计算源文件Hash（用于去重）
+        if isinstance(item, FileInfo):
+            source_hashes = CalculateHashService.calculate_file_hash(
+                item.source_path,
+                self.config.hash.required_hash_algorithms
+            )
+        else:
+            source_hashes = CalculateHashService.calculate_folder_hash(
+                {
+                    'source_path': str(item.source_path),
+                    'classify_result': item.classify_result.value
+                },
+                self.config.hash.required_hash_algorithms
+            )
+
+        # 计算ZIP Hash（用于BackupPackage）
         zip_hashes = CalculateHashService.calculate_file_hash(
             zip_path,
             self.config.hash.required_hash_algorithms
         )
 
         with self.db_service.get_session() as session:
-            # 保存源文件信息
+            # 保存源文件信息（使用源文件hash，用于去重）
             if isinstance(item, FileInfo):
                 source_file = SourceFile(
                     file_path=str(item.source_path),
                     file_name=item.source_path.name,
                     file_size=item.file_size,
-                    md5_hash=zip_hashes['md5'],
-                    sha1_hash=zip_hashes['sha1'],
-                    sha256_hash=zip_hashes['sha256'],
+                    md5_hash=source_hashes['md5'],
+                    sha1_hash=source_hashes['sha1'],
+                    sha256_hash=source_hashes['sha256'],
                     is_backup=False,
                 )
             else:
@@ -476,15 +498,15 @@ class MainOrchestrator:
                     file_path=str(item.source_path),
                     file_name=item.source_path.name,
                     file_size=item.total_size,
-                    md5_hash=zip_hashes['md5'],
-                    sha1_hash=zip_hashes['sha1'],
-                    sha256_hash=zip_hashes['sha256'],
+                    md5_hash=source_hashes['md5'],
+                    sha1_hash=source_hashes['sha1'],
+                    sha256_hash=source_hashes['sha256'],
                     is_backup=False,
                 )
             session.add(source_file)
             session.flush()
 
-            # 保存压缩包信息
+            # 保存压缩包信息（使用ZIP hash，用于完整性验证）
             package = BackupPackage(
                 package_path=str(zip_path),
                 source_file_id=source_file.id,
@@ -531,12 +553,24 @@ class MainOrchestrator:
         """上传成功回调"""
         self._log(f"上传成功: {result.task.zip_path}")
 
-        # 清理本地文件
+        # 清理本地压缩包
         try:
             if result.task.zip_path.exists():
                 result.task.zip_path.unlink()
         except Exception:
             pass
+
+        # 清理源文件/文件夹
+        try:
+            if result.task.source_path.exists():
+                if result.task.source_path.is_file():
+                    result.task.source_path.unlink()
+                else:
+                    import shutil
+                    shutil.rmtree(result.task.source_path)
+                self._log(f"已清理源文件: {result.task.source_path}")
+        except Exception as e:
+            self._log(f"清理源文件失败: {result.task.source_path}, 错误: {e}")
 
         # 标记源文件为已备份
         with self.db_service.get_session() as session:

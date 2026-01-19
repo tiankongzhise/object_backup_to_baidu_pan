@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import re
+import time
 from dotenv import load_dotenv
 import hashlib
 from pprint import pprint
@@ -11,6 +12,90 @@ from .utils import extract_date_and_password_from_path
 from .oauth import oauthtoken_refreshtoken
 
 load_dotenv()
+
+# 重试配置
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # 秒
+
+
+def _is_network_error(exception: Exception) -> bool:
+    """判断是否是网络连接异常或超时
+
+    Args:
+        exception: 异常对象
+
+    Returns:
+        bool: 是否是网络异常
+    """
+    exception_str = str(exception).lower()
+
+    # 网络连接相关关键词
+    network_keywords = [
+        'connection',
+        'timeout',
+        'timed out',
+        'network',
+        'socket',
+        'econnreset',
+        'econnrefused',
+        'enetunreach',
+        'ehostunreach',
+        'etimedout',
+        'temporary failure',
+        'name or service not known',
+        'no route to host',
+        'connection refused',
+        'connection reset',
+        'connection closed',
+        'ssl',
+        'tls',
+        'handshake',
+    ]
+
+    # 检查异常消息是否包含网络关键词
+    for keyword in network_keywords:
+        if keyword in exception_str:
+            return True
+
+    # 检查异常类型
+    exception_type = type(exception).__name__
+    network_types = [
+        'ConnectionError',
+        'TimeoutError',
+        'OSError',
+        'BrokenPipeError',
+        'ConnectionResetError',
+        'ConnectionAbortedError',
+        'ConnectionRefusedError',
+        'ConnectionRefusedError',
+    ]
+
+    # 检查是否是 requests 相关的网络异常
+    if 'requests' in exception_type.lower() or hasattr(exception, 'request'):
+        if hasattr(exception, 'response') and exception.response is not None:
+            status_code = exception.response.status_code
+            # 5xx 服务器错误通常是临时性的网络问题
+            if 500 <= status_code < 600:
+                return True
+            # 408 Request Timeout
+            if status_code == 408:
+                return True
+            # 429 Too Many Requests (可能是临时性的)
+            if status_code == 429:
+                return True
+
+    # 检查 urllib3 相关异常
+    if 'urllib3' in exception_type.lower():
+        return True
+
+    # 检查 openapi_client 异常的状态码
+    if isinstance(exception, openapi_client.ApiException):
+        if exception.status >= 500:
+            return True
+        if exception.status == 408:
+            return True
+
+    return False
 
 
 class UploadService:
@@ -148,36 +233,52 @@ class UploadService:
 
     def precreate(self):
         """
-        precreate
+        precreate - 创建文件上传前的预创建信息，带网络异常重试
         """
         if not self.file_path.exists():
             raise FileNotFoundError(f"file_path:{self.file_path} not exists!")
         if not self.file_path.is_file():
             raise ValueError(f"file_path:{self.file_path} is not a file,folder is not supported")
         self._set_remote_path()
-        #    Enter a context with an instance of the API client
-        with openapi_client.ApiClient() as api_client:
-            # Create an instance of the API class
-            api_instance = fileupload_api.FileuploadApi(api_client)
-            access_token = os.getenv("BAIDU_PAN_ACCESS_TOKEN")  # str |
-            path = self.remote_path  # str | 对于一般的第三方软件应用，路径以 "/apps/your-app-name/" 开头。对于小度等硬件应用，路径一般 "/来自：小度设备/" 开头。对于定制化配置的硬件应用，根据配置情况进行填写。
-            isdir = 0  # int | isdir
-            self.size = self.file_path.stat().st_size  # int | size
-            autoinit = 1  # int | autoinit
-            self.block_list_jsonstr = self._create_block_list() # str | 由MD5字符串组成的list
-            rtype = self.rtype  # int | rtype (optional)
-            # example passing only required values which don't have defaults set
-            # and optional values
+
+        last_exception = None
+        for attempt in range(MAX_RETRIES):
             try:
-                api_response = api_instance.xpanfileprecreate(
-                    access_token, path, isdir, self.size, autoinit, self.block_list_jsonstr, rtype=rtype)
-                print(api_response)
-                self.upload_id = api_response['uploadid']
-                self.block_list = api_response['block_list']
-                return self
-            except openapi_client.ApiException as e:
-                print("Exception when calling FileuploadApi->xpanfileprecreate: %s\n" % e)
-                exit(-1)
+                # Enter a context with an instance of the API client
+                with openapi_client.ApiClient() as api_client:
+                    # Create an instance of the API class
+                    api_instance = fileupload_api.FileuploadApi(api_client)
+                    access_token = os.getenv("BAIDU_PAN_ACCESS_TOKEN")  # str |
+                    path = self.remote_path  # str | 对于一般的第三方软件应用，路径以 "/apps/your-app-name/" 开头。对于小度等硬件应用，路径一般 "/来自：小度设备/" 开头。对于定制化配置的硬件应用，根据配置情况进行填写。
+                    isdir = 0  # int | isdir
+                    self.size = self.file_path.stat().st_size  # int | size
+                    autoinit = 1  # int | autoinit
+                    self.block_list_jsonstr = self._create_block_list() # str | 由MD5字符串组成的list
+                    rtype = self.rtype  # int | rtype (optional)
+                    # example passing only required values which don't have defaults set
+                    # and optional values
+                    api_response = api_instance.xpanfileprecreate(
+                        access_token, path, isdir, self.size, autoinit, self.block_list_jsonstr, rtype=rtype)
+                    print(api_response)
+                    self.upload_id = api_response['uploadid']
+                    self.block_list = api_response['block_list']
+                    return self
+            except Exception as e:
+                last_exception = e
+                # 检查是否是网络异常
+                if _is_network_error(e):
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (attempt + 1)  # 指数退避
+                        print(f"[precreate] 网络异常: {e}, {attempt + 1}/{MAX_RETRIES} 次尝试, {delay}秒后重试")
+                        time.sleep(delay)
+                        continue
+                # 非网络异常或重试用尽，直接抛出
+                print(f"[precreate] 错误: {e}")
+                raise
+
+        # 理论上不会到达这里，但为了安全
+        if last_exception:
+            raise last_exception
     
     def _get_file(self, partseq):
         try:
@@ -186,56 +287,91 @@ class UploadService:
         except Exception as e:
             print(f"Exception when open file:{e}")
             exit(-1)
+
     def upload(self):
         """
-        upload
+        upload - 上传文件分片，带网络异常重试
         """
-        # Enter a context with an instance of the API client
-        with openapi_client.ApiClient() as api_client:
-            # Create an instance of the API class
-            api_instance = fileupload_api.FileuploadApi(api_client)
-            access_token = os.getenv("BAIDU_PAN_ACCESS_TOKEN")  # str |
-            for partseq in self.block_list:
-                path = self.remote_path  # str |
-                uploadid = self.upload_id  # str |
-                type = "tmpfile"  # str |
-                file = self._get_file(partseq)  # file_type | 要进行传送的本地文件分片
-                # example passing only required values which don't have defaults set
-                # and optional values
+        last_exception = None
+        for partseq in self.block_list:
+            path = self.remote_path  # str |
+            uploadid = self.upload_id  # str |
+            type = "tmpfile"  # str |
+            file = self._get_file(partseq)  # file_type | 要进行传送的本地文件分片
+
+            for attempt in range(MAX_RETRIES):
                 try:
-                    api_response = api_instance.pcssuperfile2(
-                        access_token, str(partseq), path, uploadid, type, file=file)
-                    pprint(api_response)
-                except openapi_client.ApiException as e:
-                    print("Exception when calling FileuploadApi->pcssuperfile2: %s\n" % e)
+                    # Enter a context with an instance of the API client
+                    with openapi_client.ApiClient() as api_client:
+                        # Create an instance of the API class
+                        api_instance = fileupload_api.FileuploadApi(api_client)
+                        access_token = os.getenv("BAIDU_PAN_ACCESS_TOKEN")  # str |
+                        api_response = api_instance.pcssuperfile2(
+                            access_token, str(partseq), path, uploadid, type, file=file)
+                        pprint(api_response)
+                        break  # 成功，跳出重试循环
+                except Exception as e:
+                    last_exception = e
+                    # 检查是否是网络异常
+                    if _is_network_error(e):
+                        if attempt < MAX_RETRIES - 1:
+                            delay = RETRY_DELAY * (attempt + 1)  # 指数退避
+                            print(f"[upload] 分片 {partseq} 网络异常: {e}, {attempt + 1}/{MAX_RETRIES} 次尝试, {delay}秒后重试")
+                            time.sleep(delay)
+                            continue
+                    # 非网络异常或重试用尽，直接抛出
+                    print(f"[upload] 分片 {partseq} 错误: {e}")
+                    raise
+            # 确保文件关闭
+            try:
+                file.close()
+            except Exception:
+                pass
+
         print("upload done")
         return self
 
     def create(self):
         """
-        create
+        create - 创建文件（完成上传流程），带网络异常重试
         """
-        # Enter a context with an instance of the API client
-        with openapi_client.ApiClient() as api_client:
-            # Create an instance of the API class
-            api_instance = fileupload_api.FileuploadApi(api_client)
-            access_token = os.getenv("BAIDU_PAN_ACCESS_TOKEN")  # str |
-            path = self.remote_path  # str | 与precreate的path值保持一致
-            isdir = 0  # int | isdir
-            size = self.size # int | 与precreate的size值保持一致
-            uploadid = self.upload_id  # str | precreate返回的uploadid
-            block_list = self.block_list_jsonstr  # str | 与precreate的block_list值保持一致
-            rtype = self.rtype  # int | rtype (optional)
-
-            # example passing only required values which don't have defaults set
-            # and optional values
+        last_exception = None
+        for attempt in range(MAX_RETRIES):
             try:
-                api_response = api_instance.xpanfilecreate(
-                    access_token, path, isdir, size, uploadid, block_list, rtype=rtype)
-                pprint(api_response)
-                return api_response
-            except openapi_client.ApiException as e:
-                print("Exception when calling FileuploadApi->xpanfilecreate: %s\n" % e)
+                # Enter a context with an instance of the API client
+                with openapi_client.ApiClient() as api_client:
+                    # Create an instance of the API class
+                    api_instance = fileupload_api.FileuploadApi(api_client)
+                    access_token = os.getenv("BAIDU_PAN_ACCESS_TOKEN")  # str |
+                    path = self.remote_path  # str | 与precreate的path值保持一致
+                    isdir = 0  # int | isdir
+                    size = self.size # int | 与precreate的size值保持一致
+                    uploadid = self.upload_id  # str | precreate返回的uploadid
+                    block_list = self.block_list_jsonstr  # str | 与precreate的block_list值保持一致
+                    rtype = self.rtype  # int | rtype (optional)
+
+                    # example passing only required values which don't have defaults set
+                    # and optional values
+                    api_response = api_instance.xpanfilecreate(
+                        access_token, path, isdir, size, uploadid, block_list, rtype=rtype)
+                    pprint(api_response)
+                    return api_response
+            except Exception as e:
+                last_exception = e
+                # 检查是否是网络异常
+                if _is_network_error(e):
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAY * (attempt + 1)  # 指数退避
+                        print(f"[create] 网络异常: {e}, {attempt + 1}/{MAX_RETRIES} 次尝试, {delay}秒后重试")
+                        time.sleep(delay)
+                        continue
+                # 非网络异常或重试用尽，直接抛出
+                print(f"[create] 错误: {e}")
+                raise
+
+        # 理论上不会到达这里，但为了安全
+        if last_exception:
+            raise last_exception
     def _clean_tmp(self):
         if self.temp_dir:
             import shutil

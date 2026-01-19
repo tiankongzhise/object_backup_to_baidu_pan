@@ -7,5 +7,6 @@ def test_rest_table():
     database_service.create_tables()
 
 if __name__ == '__main__':
-    # main()
-    test_rest_table()
+    # test_rest_table()
+    main()
+   

@@ -18,6 +18,10 @@ from ..models import BackupPackage
 from datetime import datetime
 
 
+# 停止标记，用于唤醒阻塞的队列获取
+_STOP_SENTINEL = object()
+
+
 @dataclass
 class UploadTask:
     """上传任务"""
@@ -106,6 +110,12 @@ class QueueManager:
         self._running = False
         self._stop_event.set()
 
+        # 发送停止标记以唤醒阻塞的队列获取
+        try:
+            self._queue.put_nowait(_STOP_SENTINEL)
+        except Exception:
+            pass
+
         if self._worker_thread:
             self._worker_thread.join(timeout=5)
             self._worker_thread = None
@@ -116,6 +126,13 @@ class QueueManager:
             try:
                 # 获取任务，超时1秒
                 task = self._queue.get(timeout=1)
+
+                # 检查是否是停止标记
+                if task is _STOP_SENTINEL:
+                    # 标记完成并退出
+                    self._queue.task_done()
+                    break
+
             except Empty:
                 continue
 

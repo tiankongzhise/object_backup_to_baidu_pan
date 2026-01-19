@@ -50,14 +50,12 @@ class UploadService:
         # 本地路径格式: {compress_dir}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
         path_parts = self.file_path.parent.parts
         source_folder_name = None
-        for part in reversed(path_parts):
+        for index, part in enumerate(reversed(path_parts)):
             # 跳过日期和压缩根目录，找到源文件夹名
             if re.match(r'^\d{8}$', part):
-                continue
-            if part == 'item_backup' or part == 'compress':
-                continue
-            source_folder_name = part
-            break
+                if index +1 <= len(path_parts):
+                    source_folder_name = path_parts[index + 1]
+                    break
 
         if not source_folder_name:
             source_folder_name = "unknown"

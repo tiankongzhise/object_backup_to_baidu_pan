@@ -62,7 +62,7 @@ class VerifyService:
         Returns:
             VerifyResult: 验证结果
         """
-        extracted_path = None
+        extracted_path: Path | None = None
 
         try:
             # 1. 解压ZIP
@@ -103,14 +103,12 @@ class VerifyService:
             )
 
         except Exception as e:
-            # 清理解压目录
-            if extracted_path and extracted_path.exists():
-                shutil.rmtree(extracted_path, ignore_errors=True)
-
             return VerifyResult(
                 is_valid=False,
                 error_message=str(e),
             )
+        finally:
+            self.cleanup_extracted(extracted_path)
 
     def _compare_hashes(self, extracted: dict, source: dict) -> bool:
         """比较两组Hash值
@@ -135,5 +133,10 @@ class VerifyService:
         Args:
             extracted_path: 解压目录路径
         """
-        if extracted_path and extracted_path.exists():
-            shutil.rmtree(extracted_path, ignore_errors=True)
+        if extracted_path.exists():
+            if extracted_path.is_dir():
+                shutil.rmtree(extracted_path, ignore_errors=True)
+            elif extracted_path.is_file():
+                extracted_path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError(f"Unknown file type: {extracted_path}")

@@ -53,9 +53,11 @@ def run_cli(config_path: str):
     try:
         orchestrator.run()
         print("备份完成")
+        sys.exit(0)
     except KeyboardInterrupt:
         print("\n用户中断")
         orchestrator.stop()
+        sys.exit(1)
     except Exception as e:
         print(f"错误: {e}")
         sys.exit(1)

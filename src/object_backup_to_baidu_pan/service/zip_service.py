@@ -1,65 +1,174 @@
+"""
+ZIP压缩和解压服务模块
+
+提供AES加密压缩和解压功能，支持文件和文件夹的加密打包。
+
+主要功能:
+- AES-256加密压缩（使用pyzipper）
+- 文件夹递归压缩，保持目录结构
+- 解压验证，支持密码验证
+- 文件按路径排序确保压缩包一致性
+
+加密说明:
+- 使用WinZip AES-256加密算法
+- 压缩级别0-9，0为存储模式（不压缩）
+- 支持自定义盐值增强安全性
+"""
+
 from dowhen import when
 import pyzipper
 from os import PathLike
 import pathlib
 import datetime
+from typing import Optional
+
 from ..config import ZipConfig
 
 
-def add_self_salt(self):
-    self.salt = ZipConfig.salt[self.salt_length]
+def _add_self_salt(self) -> None:
+    """为AES加密ZIP添加随机盐值（内部使用）
+
+    通过dowhen库动态修改AESZipEncrypter类的pwd_verify_length属性，
+    以支持任意长度的密码。
+
+    Note:
+        这是pyzipper库的特定hack，用于支持短密码
+    """
+    zip_config = ZipConfig()
+    self.salt = zip_config.salt[self.salt_length]
 
 
-def _add_file_to_zip(zipf: pyzipper.ZipFile, file_path: pathlib.Path, arcname: str) -> None:
-    """添加单个文件到ZIP压缩包"""
+def _add_file_to_zip(zipf: pyzipper.AESZipFile, file_path: pathlib.Path, arcname: str) -> None:
+    """添加单个文件到ZIP压缩包
+
+    Args:
+        zipf: AESZipFile对象
+        file_path: 源文件路径
+        arcname: 在ZIP中的文件名（相对路径）
+    """
     zipf.write(file_path, arcname)
 
-def _add_directory_to_zip(zipf: pyzipper.ZipFile, directory_path: pathlib.Path) -> None:
+
+def _add_directory_to_zip(zipf: pyzipper.AESZipFile, directory_path: pathlib.Path) -> None:
+    """添加整个目录到ZIP压缩包
+
+    递归遍历目录，收集所有文件并按路径排序后添加。
+    排序确保相同内容的目录在不同环境下产生相同的压缩包。
+
+    Args:
+        zipf: AESZipFile对象
+        directory_path: 源目录路径
+
+    Note:
+        - 使用rglob('*')递归获取所有项
+        - 按小写路径名排序确保跨平台一致性
+        - 相对路径计算考虑父目录不同的情况
     """
-    添加整个目录到ZIP压缩包，确保文件按路径排序[6](@ref)
-    """
-    all_files = []
-    
-    # 递归收集所有文件路径[1,2](@ref)
+    all_files: list[tuple[pathlib.Path, str]] = []
+
+    # 递归收集所有文件路径
     for file_path in directory_path.rglob('*'):
         if file_path.is_file():
-            # 计算在ZIP中的相对路径[11](@ref)
-            relative_path = file_path.relative_to(directory_path.parent 
-                if directory_path.parent != directory_path 
-                else directory_path)
+            # 计算在ZIP中的相对路径
+            # 如果directory_path.parent != directory_path，说明directory_path不是根目录
+            parent = directory_path.parent if directory_path.parent != directory_path else directory_path
+            relative_path = file_path.relative_to(parent)
             all_files.append((file_path, str(relative_path)))
-    
-    # 按路径排序确保一致性[6](@ref)
+
+    # 按路径排序确保一致性（跨平台、跨文件系统）
     all_files.sort(key=lambda x: x[1].lower())
-    
+
     # 按排序后的顺序添加文件
     for file_path, arcname in all_files:
         _add_file_to_zip(zipf, file_path, arcname)
 
 
 class ZipService:
-    """ZIP压缩和解压服务"""
+    """ZIP压缩和解压服务类
+
+    提供完整的AES加密压缩和解压功能。
+
+    路径格式约定:
+        - 本地ZIP路径: {target_dir}/YYYYMMDD/解压密码_{password}/{source_name}.zip
+        - 无密码路径: {target_dir}/YYYYMMDD/{source_name}.zip
+
+    Attributes:
+        无类属性，所有方法均为静态方法
+    """
+
     @staticmethod
-    def zip_item(source_item:PathLike,target_dir:PathLike,password:str|None=None,compress_level:int=6):
+    def zip_item(
+        source_item: PathLike,
+        target_dir: PathLike,
+        password: Optional[str] = None,
+        compress_level: int = 6
+    ) -> pathlib.Path:
+        """压缩文件或文件夹为AES加密ZIP
+
+        使用WinZip AES-256加密算法对文件进行压缩。
+
+        Args:
+            source_item: 源文件或文件夹路径（PathLike类型，支持str、Path等）
+            target_dir: 目标目录路径，ZIP文件将创建在此目录下
+            password: 压缩密码（可选）
+                - 为None时不加密
+                - 设置时使用AES-256加密
+            compress_level: 压缩级别（0-9）
+                - 0: 存储模式，不压缩（推荐用于已压缩文件如zip、mp4）
+                - 1: 最快压缩，速度最快但压缩比最低
+                - 9: 最优压缩，速度最慢但压缩比最高
+                - 默认值: 6（平衡速度与压缩比）
+
+        Returns:
+            pathlib.Path: 生成的ZIP文件绝对路径
+
+        Raises:
+            FileNotFoundError: 源路径不存在
+            IsADirectoryError: 目标路径是文件而非目录
+            TypeError: 压缩级别不是整数
+            RuntimeError: 压缩过程发生错误
+
+        Example:
+            >>> from service.zip_service import ZipService
+            >>> # 压缩文件夹（带密码）
+            >>> zip_path = ZipService.zip_item(
+            ...     source_item='/path/to/folder',
+            ...     target_dir='/tmp/compress',
+            ...     password='my_secure_password',
+            ...     compress_level=0
+            ... )
+            >>> print(zip_path)
+            /tmp/compress/20260118/解压密码_my_secure_password/folder.zip
+        """
         source_item = pathlib.Path(source_item)
         target_dir = pathlib.Path(target_dir)
+
+        # 验证输入参数
         if not source_item.exists():
-            raise FileNotFoundError(f"source_item {source_item} not exists")
+            raise FileNotFoundError(f"源路径不存在: {source_item}")
         if target_dir.is_file():
-            raise IsADirectoryError(f"target_dir {target_dir} is a file,shoud be a folder")
-        if not isinstance(compress_level,int):
-            raise TypeError(f"compress_level {compress_level} should be int")
-        
+            raise IsADirectoryError(f"目标路径是文件，应为目录: {target_dir}")
+        if not isinstance(compress_level, int):
+            raise TypeError(f"压缩级别应为整数，实际为: {type(compress_level)}")
+
+        # 构建输出路径
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
         if password:
-            ziped_item = target_dir / datetime.datetime.now().strftime("%Y%m%d") / f'解压密码_{password}' / f'{source_item.name}.zip'
+            # 带密码: {target_dir}/YYYYMMDD/解压密码_{password}/{source_item.name}.zip
+            ziped_item = target_dir / date_str / f'解压密码_{password}' / f'{source_item.name}.zip'
         else:
-            ziped_item = target_dir / datetime.datetime.now().strftime("%Y%m%d") / f'{source_item.name}.zip'
+            # 无密码: {target_dir}/YYYYMMDD/{source_item.name}.zip
+            ziped_item = target_dir / date_str / f'{source_item.name}.zip'
+
+        # 确保父目录存在
         ziped_item.parent.mkdir(parents=True, exist_ok=True)
-        
+
+        # 限制压缩级别在有效范围[0, 9]
         compress_level = max(0, min(9, compress_level))
 
-        with when(pyzipper.zipfile_aes.AESZipEncrypter, 'pwd_verify_length = 2').do(add_self_salt):
-            try:
+        try:
+            # 使用dowhen库动态修改AESZipEncrypter以支持短密码
+            with when(pyzipper.zipfile_aes.AESZipEncrypter, 'pwd_verify_length = 2').do(_add_self_salt):
                 with pyzipper.AESZipFile(
                     ziped_item,
                     'w',
@@ -69,33 +178,63 @@ class ZipService:
                     # 设置加密密码
                     if password:
                         zipf.setpassword(password.encode('utf-8'))
-                        # 设置加密方法（AES加密）
+                        # 设置加密方法为AES（WinZip兼容）
                         zipf.encryption = pyzipper.WZ_AES
+
+                    # 根据源类型添加文件或目录
                     if source_item.is_file():
                         _add_file_to_zip(zipf, source_item, source_item.name)
                     elif source_item.is_dir():
                         _add_directory_to_zip(zipf, source_item)
                     else:
                         raise ValueError(f"不支持的源路径类型: {source_item}")
+
                     return ziped_item
-            except Exception as e:
-                if ziped_item.exists():
-                    ziped_item.unlink()
-                raise e
+
+        except Exception as e:
+            # 失败时清理已创建的不完整文件
+            if ziped_item.exists():
+                ziped_item.unlink()
+            raise
+
     @staticmethod
-    def unzip_item(zip_path: PathLike, target_dir: PathLike = None, password: str | None = None) -> pathlib.Path:
-        """
-        解压ZIP文件到目标目录
+    def unzip_item(
+        zip_path: PathLike,
+        target_dir: Optional[PathLike] = None,
+        password: Optional[str] = None
+    ) -> pathlib.Path:
+        """解压ZIP文件到目标目录
+
+        解压使用WinZip AES加密的ZIP文件，支持密码验证。
 
         Args:
             zip_path: ZIP文件路径
-            target_dir: 目标目录，默认为 ClassifyConfig.unzip_folder
+            target_dir: 目标目录路径
+                - 为None时使用ZipConfig.unzip_folder
+                - 默认值: None
             password: 解压密码（可选）
+                - 为None时假设ZIP无密码
+                - 密码错误会抛出异常
 
         Returns:
-            解压后的根目录路径
+            pathlib.Path: 解压后的根目录绝对路径
+
+        Raises:
+            FileNotFoundError: ZIP文件不存在
+            RuntimeError: 解压过程发生错误（如密码错误）
+
+        Example:
+            >>> from service.zip_service import ZipService
+            >>> extract_path = ZipService.unzip_item(
+            ...     zip_path='/tmp/compress/20260118/解压密码_pass/test.zip',
+            ...     target_dir='/tmp/extract',
+            ...     password='pass'
+            ... )
+            >>> print(extract_path)
+            /tmp/extract/test
         """
         zip_path = pathlib.Path(zip_path)
+
         if target_dir is None:
             target_dir = pathlib.Path(ZipConfig.unzip_folder)
         else:
@@ -114,11 +253,15 @@ class ZipService:
                 # 获取ZIP内的根目录名作为解压后的顶层目录
                 all_names = zipf.namelist()
                 if all_names:
+                    # 假设第一个文件所在的目录即为根目录
                     root_prefix = all_names[0].split('/')[0]
                     extract_to = target_dir / root_prefix
                 else:
+                    # 空ZIP则使用文件名作为根目录
                     extract_to = target_dir / zip_path.stem
+
                 zipf.extractall(target_dir)
                 return extract_to
+
         except Exception as e:
-            raise e
+            raise RuntimeError(f"解压失败: {e}")

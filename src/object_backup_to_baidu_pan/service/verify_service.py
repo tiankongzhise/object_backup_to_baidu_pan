@@ -9,7 +9,7 @@ from typing import Optional
 from .zip_service import ZipService
 from .hash_service import CalculateHashService
 from .classify_service import FileInfo, FolderInfo
-from ..config import HashConfig, ZipConfig
+from ..config import HashConfig, ZipConfig, StorageConfig
 import shutil
 
 
@@ -32,16 +32,19 @@ class VerifyService:
     def __init__(
         self,
         hash_config: HashConfig | None = None,
-        zip_config: ZipConfig | None = None
+        zip_config: ZipConfig | None = None,
+        storage_config: StorageConfig | None = None
     ):
         """初始化验证服务
 
         Args:
             hash_config: Hash配置，如果为None则使用默认配置
             zip_config: ZIP配置，如果为None则使用默认配置
+            storage_config: 存储配置，如果为None则使用默认配置
         """
         self.hash_config = hash_config or HashConfig()
         self.zip_config = zip_config or ZipConfig()
+        self.storage_config = storage_config or StorageConfig()
 
     def verify_package(
         self,
@@ -65,6 +68,7 @@ class VerifyService:
             # 1. 解压ZIP
             extracted_path = ZipService.unzip_item(
                 zip_path,
+                target_dir=self.storage_config.extract_dir,
                 password=password
             )
 

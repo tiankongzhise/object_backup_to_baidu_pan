@@ -86,7 +86,7 @@ class MainOrchestrator:
         # 初始化各服务
         self.classify_service = ClassifyService(config.classify)
         self.dedupe_service = DedupeService(config.hash)
-        self.verify_service = VerifyService(config.hash, config.zip)
+        self.verify_service = VerifyService(config.hash, config.zip, config.storage)
         self.space_manager = SpaceManager(config.space)
         self.queue_manager = QueueManager(config.upload, config.zip, self.db_service)
 

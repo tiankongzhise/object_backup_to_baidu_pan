@@ -22,7 +22,7 @@ class ClassifyConfig:
     """文件分类配置"""
     file_oversize: int = 20 * 1024**3  # 20GB
     folder_oversize: int = 20 * 1024**3  # 20GB
-    overcount: int = 200  # 直接子文件数限制
+    overcount: int = 200  # 子文件数限制
     unzip_folder: Path = Path('/tmp/unzip')
 
 

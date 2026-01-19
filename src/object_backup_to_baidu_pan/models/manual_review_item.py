@@ -4,7 +4,9 @@
 """
 
 from datetime import datetime
-from sqlalchemy import Column, BigInteger, String, DateTime
+from typing import Optional
+from sqlalchemy.orm import mapped_column, Mapped
+from sqlalchemy import BigInteger, String, DateTime
 from .base import Base
 
 
@@ -12,25 +14,25 @@ class ManualReviewItem(Base):
     """人工审核项目表"""
     __tablename__ = 'manual_review_items'
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     # 文件路径信息
-    file_path = Column(String(500), nullable=False, unique=True)
-    file_size = Column(BigInteger, nullable=True)
-    file_count = Column(BigInteger, nullable=True)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
+    file_size: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    file_count: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     # 原因: size_exceeded/overcount
-    reason = Column(String(100), nullable=False)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
 
     # 状态: pending/processed
-    status = Column(String(20), default='pending', nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default='pending', nullable=False)
 
     # 备注
-    notes = Column(String(500), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     # 时间戳
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    processed_at = Column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
         return f"<ManualReviewItem(id={self.id}, reason='{self.reason}', status='{self.status}')>"

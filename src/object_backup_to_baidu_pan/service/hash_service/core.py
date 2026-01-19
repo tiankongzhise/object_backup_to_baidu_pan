@@ -12,7 +12,7 @@ import hashlib
 import pathlib
 
 
-def calculate_file_hash_base(file_path: pathlib.Path | str, algorithm: str = 'sha256') -> hashlib.Hash:
+def calculate_file_hash_base(file_path: pathlib.Path | str, algorithm: str = 'sha256'):
     """计算单个文件的哈希值（底层实现）
 
     使用分块读取方式计算文件Hash，避免大文件导致内存溢出。

@@ -8,6 +8,8 @@ from .openapi_client.api import fileupload_api
 from . import openapi_client
 from datetime import datetime
 from .utils import extract_date_and_password_from_path
+from .oauth import oauthtoken_refreshtoken
+
 load_dotenv()
 
 
@@ -23,6 +25,7 @@ class UploadService:
         self.upload_id:str = None # type: ignore
         self.temp_dir = temp_dir
         self.tmp_list:list[Path] = None # type: ignore
+        oauthtoken_refreshtoken()
         self.load_env(env_path)
 
 

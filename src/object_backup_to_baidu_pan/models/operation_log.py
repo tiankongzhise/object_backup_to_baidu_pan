@@ -7,7 +7,7 @@ from datetime import datetime
 from sqlalchemy.orm import mapped_column, Mapped
 from sqlalchemy import BigInteger, String, DateTime, Integer, Text
 from .base import Base
-
+from typing import Optional
 
 class OperationLog(Base):
     """操作日志表"""

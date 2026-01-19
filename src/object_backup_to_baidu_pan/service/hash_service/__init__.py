@@ -25,7 +25,7 @@ Hash计算服务模块
 
 from .folder_hash import calculate_folder_hash
 from .file_hash import calculate_file_hash
-
+from pathlib import Path
 
 class CalculateHashService:
     """Hash计算服务类

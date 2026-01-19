@@ -382,11 +382,18 @@ class UploadService:
         self.chunk_size = chunk_size
         self.rtype = rtype
         self.temp_dir = temp_dir
-        self.precreate()
-        self.upload()
-        result = self.create()
+        try:
+            self.precreate()
+            self.upload()
+            result = self.create()
+        except Exception as e:
+            print(f"Exception when upload_file: {e}")
+            raise
         self._clean_tmp()
-        return result
+        if result['errno'] == 0:
+            return result
+        else:
+            raise Exception(f"upload_file error: {result}")
         
     def __del__(self):
         import shutil

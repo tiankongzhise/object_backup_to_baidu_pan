@@ -5,8 +5,10 @@
 流程说明：
 1. 文件扫描分类 → 标记人工处理项到DB，只处理正常项
 2. 去重比对 → 计算Hash，与DB比对
-3. 同步处理 → 压缩+验证
-4. 异步上传 → 上传到百度网盘
+3. 启动上传队列，并发处理每个项目：
+   - 压缩+验证 → 立即提交上传任务到队列（异步上传）
+   - 后续项目继续压缩+验证，与上传并发执行
+4. 等待所有上传任务完成
 5. 人工处理检查 → 流程结束后检查是否有pending的人工处理项，发送邮件通知
 """
 
@@ -126,11 +128,12 @@ class MainOrchestrator:
             # 5. 去重比对（只处理正常文件/文件夹，跳过ManualReviewItem）
             deduplicate_results = self._deduplicate(scan_results)
 
-            # 6. 同步处理（压缩+验证）
+            # 6. 同步处理（压缩+验证），验证完一个立即提交上传任务
+            self._start_uploader()
             upload_tasks = self._process_items(deduplicate_results)
 
-            # 7. 异步上传
-            self._upload_tasks(upload_tasks)
+            # 7. 等待上传完成
+            self._wait_for_uploads()
 
             # 8. 人工处理检查
             self._check_manual_review_items()
@@ -369,11 +372,12 @@ class MainOrchestrator:
             self._log(f"发送人工处理通知邮件失败: {e}")
 
     def _process_items(self, dedupe_results: DedupeResult) -> list[UploadTask]:
-        """同步处理所有项目（压缩+验证）"""
+        """同步处理所有项目（压缩+验证），验证完一个立即提交上传任务
+
+        注意：不再返回任务列表，而是立即将任务提交到队列
+        """
         total = len(dedupe_results.to_backup)
         self._progress.total_items = total
-
-        upload_tasks: list[UploadTask] = []
 
         for i, item in enumerate(dedupe_results.to_backup):
             self._progress.current_item = str(item.source_path)
@@ -400,13 +404,13 @@ class MainOrchestrator:
                     # 记录到数据库
                     self._save_package_info(item, zip_path)
 
-                    # 创建上传任务
+                    # 创建上传任务并立即提交到队列
                     task = UploadTask(
                         zip_path=zip_path,
                         password=self.config.zip.default_password,
                         source_path=item.source_path
                     )
-                    upload_tasks.append(task)
+                    self._submit_upload_task(task)
 
                     self._progress.completed_items += 1
 
@@ -414,7 +418,7 @@ class MainOrchestrator:
                 self._log(f"处理失败: {item.source_path}, 错误: {e}")
                 self._progress.failed_items += 1
 
-        return upload_tasks
+        return []  # 任务已直接提交到队列，不再返回
 
     def _compress_item(self, item: DedupeResultItem) -> Path:
         """压缩单个项目"""
@@ -520,12 +524,8 @@ class MainOrchestrator:
             )
             session.add(package)
 
-    def _upload_tasks(self, tasks: list[UploadTask]):
-        """上传所有任务"""
-        if not tasks:
-            self._log("没有需要上传的任务")
-            return
-
+    def _start_uploader(self):
+        """启动上传队列"""
         self._update_progress(
             phase='uploading',
             current_status='正在上传...'
@@ -535,13 +535,20 @@ class MainOrchestrator:
         self.queue_manager.on_success = self._on_upload_success
         self.queue_manager.on_failed = self._on_upload_failed
 
-        # 添加任务
-        self.queue_manager.add_tasks(tasks)
-
         # 启动队列
         self.queue_manager.start()
+        self._log("上传队列已启动")
 
-        # 等待完成
+    def _submit_upload_task(self, task: UploadTask):
+        """提交上传任务到队列"""
+        self.queue_manager.add_task(task)
+        self._log(f"已提交上传任务: {task.zip_path.name}")
+
+    def _wait_for_uploads(self):
+        """等待所有上传任务完成"""
+        self._log("等待上传完成...")
+
+        # 等待队列完成
         self.queue_manager._queue.join()
 
         # 停止队列

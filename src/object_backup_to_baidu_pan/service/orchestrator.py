@@ -49,7 +49,8 @@ class BackupProgress:
     phase: str  # scanning/classifying/deduplicating/compressing/verifying/uploading/completed
     current_item: str
     total_items: int
-    completed_items: int
+    completed_items: int  # 上传成功数量
+    deleted_duplicates: int  # 删除的重复项数量
     failed_items: int
     current_status: str
     error_message: Optional[str] = None
@@ -101,6 +102,7 @@ class MainOrchestrator:
             current_item='',
             total_items=0,
             completed_items=0,
+            deleted_duplicates=0,
             failed_items=0,
             current_status='就绪'
         )
@@ -229,7 +231,7 @@ class MainOrchestrator:
                 # 已备份，清理重复文件
                 self._log(f"文件已备份，清理: {item.source_path}")
                 self._cleanup_duplicate(item)
-                self._progress.completed_items += 1
+                self._progress.deleted_duplicates += 1
                 return
 
             # 2. 判断是否是已压缩文件
@@ -1013,7 +1015,12 @@ class MainOrchestrator:
         # 停止队列
         self.queue_manager.stop()
 
-        self._log(f"上传完成: 成功 {self._progress.completed_items}, 失败 {self._progress.failed_items}")
+        self._log(
+            f"上传完成: "
+            f"上传成功 {self._progress.completed_items}, "
+            f"删除重复项 {self._progress.deleted_duplicates}, "
+            f"失败 {self._progress.failed_items}"
+        )
 
     def _on_upload_success(self, result: UploadResult):
         """上传成功回调"""

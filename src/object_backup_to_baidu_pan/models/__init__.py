@@ -8,6 +8,7 @@ from .source_file import SourceFile
 from .backup_package import BackupPackage
 from .manual_review_item import ManualReviewItem
 from .operation_log import OperationLog
+from .duplicate_file import DuplicateFile
 
 __all__ = [
     'Base',
@@ -15,4 +16,5 @@ __all__ = [
     'BackupPackage',
     'ManualReviewItem',
     'OperationLog',
+    'DuplicateFile',
 ]

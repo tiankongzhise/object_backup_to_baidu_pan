@@ -411,8 +411,8 @@ class MainOrchestrator:
                     zip_path = item.source_path  # 直接使用源文件
                     self._log(f"源文件已是压缩文件，直接上传: {zip_path}")
 
-                    # 记录到数据库（标记为is_source_archive=True）
-                    self._save_package_info(item, zip_path, is_source_archive=True, source_hashes=source_hashes)
+                    # 记录到数据库（标记为is_source_archive=True，hash从数据库获取）
+                    self._save_package_info(item, zip_path, is_source_archive=True)
 
                     # 获取源文件夹名称（用于远端路径）
                     source_folder_name = item.source_path.parent.name
@@ -441,11 +441,11 @@ class MainOrchestrator:
                             phase='verifying',
                             current_status=f'正在验证 ({i+1}/{total})'
                         )
-                        if not self._verify_item(item, zip_path, source_hashes):
+                        if not self._verify_item(item, zip_path):
                             continue  # 验证失败，重新压缩
 
-                        # 记录到数据库
-                        self._save_package_info(item, zip_path, is_source_archive=False, source_hashes=source_hashes)
+                        # 记录到数据库（hash从数据库获取）
+                        self._save_package_info(item, zip_path, is_source_archive=False)
 
                         # 创建上传任务并立即提交到队列
                         task = UploadTask(
@@ -507,15 +507,22 @@ class MainOrchestrator:
 
         return zip_path
 
-    def _verify_item(self, item: DedupeResultItem, zip_path: Path, source_hashes: dict | None = None) -> bool:
+    def _verify_item(self, item: DedupeResultItem, zip_path: Path) -> bool:
         """验证单个压缩包
+
+        源文件hash从数据库获取（去重阶段已保存）
 
         Args:
             item: 去重结果项
             zip_path: 压缩包路径
-            source_hashes: 源文件hash（如果为None则重新计算）
+
+        Returns:
+            bool: 验证是否成功
         """
         password = self.config.source.password or self.config.zip.default_password
+
+        # 从数据库获取源文件hash
+        source_hashes = self._get_source_hashes_from_db(item)
 
         result = self.verify_service.verify_package(
             zip_path=zip_path,
@@ -541,31 +548,20 @@ class MainOrchestrator:
     def _save_package_info(self, item: DedupeResultItem, zip_path: Path, is_source_archive: bool = False, source_hashes: dict | None = None):
         """保存压缩包信息到数据库
 
-        注意：SourceFile保存源文件的hash（用于去重），BackupPackage保存ZIP的hash（用于完整性验证）
+        注意：SourceFile记录在去重阶段已创建，这里只更新或关联，不创建新的SourceFile记录
+        BackupPackage保存ZIP的hash（用于完整性验证）
 
         Args:
             item: 去重结果项
             zip_path: 压缩包路径
             is_source_archive: 是否是已压缩文件直接上传
-            source_hashes: 源文件hash（如果为None则重新计算）
+            source_hashes: 源文件hash（如果为None则从数据库获取）
         """
         password = self.config.source.password or self.config.zip.default_password
 
-        # 如果已传入source_hashes则使用，否则重新计算
+        # 如果已传入source_hashes则使用，否则从数据库获取
         if source_hashes is None:
-            if isinstance(item, FileInfo):
-                source_hashes = CalculateHashService.calculate_file_hash(
-                    item.source_path,
-                    self.config.hash.required_hash_algorithms
-                )
-            else:
-                source_hashes = CalculateHashService.calculate_folder_hash(
-                    {
-                        'source_path': str(item.source_path),
-                        'classify_result': item.classify_result.value
-                    },
-                    self.config.hash.required_hash_algorithms
-                )
+            source_hashes = self._get_source_hashes_from_db(item)
 
         # 计算ZIP Hash（用于BackupPackage）
         zip_hashes = CalculateHashService.calculate_file_hash(
@@ -574,30 +570,45 @@ class MainOrchestrator:
         )
 
         with self.db_service.get_session() as session:
-            # 保存源文件信息（使用源文件hash，用于去重）
-            if isinstance(item, FileInfo):
-                source_file = SourceFile(
-                    hostname=self.hostname,
-                    file_path=str(item.source_path),
-                    file_name=item.source_path.name,
-                    file_size=item.file_size,
-                    md5_hash=source_hashes['md5'],
-                    sha1_hash=source_hashes['sha1'],
-                    sha256_hash=source_hashes['sha256'],
-                    is_backup=False,
+            # 查找已存在的SourceFile记录（去重阶段已创建）
+            source_file = session.query(SourceFile).filter(
+                and_(
+                    SourceFile.hostname == self.hostname,
+                    SourceFile.file_path == str(item.source_path)
                 )
+            ).first()
+
+            if source_file:
+                # 更新已存在的记录
+                source_file.file_name = item.source_path.name
+                source_file.file_size = item.file_size if isinstance(item, FileInfo) else item.total_size
             else:
-                source_file = SourceFile(
-                    hostname=self.hostname,
-                    file_path=str(item.source_path),
-                    file_name=item.source_path.name,
-                    file_size=item.total_size,
-                    md5_hash=source_hashes['md5'],
-                    sha1_hash=source_hashes['sha1'],
-                    sha256_hash=source_hashes['sha256'],
-                    is_backup=False,
-                )
-            session.add(source_file)
+                # 理论上不应该到这里，因为去重阶段应该已创建记录
+                # 但为了安全，还是创建新记录
+                if isinstance(item, FileInfo):
+                    source_file = SourceFile(
+                        hostname=self.hostname,
+                        file_path=str(item.source_path),
+                        file_name=item.source_path.name,
+                        file_size=item.file_size,
+                        md5_hash=source_hashes['md5'],
+                        sha1_hash=source_hashes['sha1'],
+                        sha256_hash=source_hashes['sha256'],
+                        is_backup=False,
+                    )
+                else:
+                    source_file = SourceFile(
+                        hostname=self.hostname,
+                        file_path=str(item.source_path),
+                        file_name=item.source_path.name,
+                        file_size=item.total_size,
+                        md5_hash=source_hashes['md5'],
+                        sha1_hash=source_hashes['sha1'],
+                        sha256_hash=source_hashes['sha256'],
+                        is_backup=False,
+                    )
+                session.add(source_file)
+
             session.flush()
 
             # 保存压缩包信息（使用ZIP hash，用于完整性验证）

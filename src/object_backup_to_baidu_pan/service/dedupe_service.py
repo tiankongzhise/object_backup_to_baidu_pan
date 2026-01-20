@@ -11,7 +11,7 @@ from sqlalchemy import and_
 from .classify_service import FileInfo, FolderInfo, ManualReviewItem, ClassifyResult, ScanResult
 from .hash_service import CalculateHashService
 from ..config import HashConfig, get_hostname
-from ..models import SourceFile, BackupPackage
+from ..models import SourceFile, BackupPackage, DuplicateFile
 
 
 # 去重结果
@@ -47,6 +47,7 @@ class DedupeService:
 
         同时查询 source_files 和 backup_packages（已完成的）进行去重
         注意：计算出的hash会立即保存到数据库，供后续阶段使用
+        重复文件会记录到 duplicate_files 表
 
         Args:
             items: 分类后的项目列表
@@ -93,6 +94,9 @@ class DedupeService:
                 # 更新 source_files 中的文件路径（如果不同）
                 if existing_source and existing_source.file_path != str(item.source_path):
                     existing_source.file_path = str(item.source_path)
+
+                # 记录重复文件信息
+                self._record_duplicate(session, item, hashes, existing_source)
             else:
                 # 数据库中不存在，添加到待备份列表
                 # 同时将源文件信息保存到数据库（供后续阶段从数据库获取hash）
@@ -140,6 +144,49 @@ class DedupeService:
                 is_backup=False,
             )
             session.add(source_file)
+
+    def _record_duplicate(self, session: Session, item: DedupeResultItem, hashes: dict, existing_source: Optional[SourceFile]):
+        """记录重复文件信息到数据库
+
+        Args:
+            session: 数据库会话
+            item: 当前扫描到的文件/文件夹
+            hashes: 当前文件的hash值
+            existing_source: 数据库中已存在的相同hash记录
+        """
+        # 查找该hash是否已有重复记录
+        existing_dup = session.query(DuplicateFile).filter(
+            and_(
+                DuplicateFile.hostname == self.hostname,
+                DuplicateFile.md5_hash == hashes['md5'],
+                DuplicateFile.sha1_hash == hashes['sha1'],
+                DuplicateFile.sha256_hash == hashes['sha256']
+            )
+        ).first()
+
+        if existing_dup:
+            # 已存在重复记录，更新
+            existing_dup.duplicate_count += 1
+            existing_dup.reason = f"与文件 {existing_dup.file_path} 内容完全相同（Hash一致）"
+            # 保留第一个文件作为主文件
+        else:
+            # 新建重复记录
+            master_path = existing_source.file_path if existing_source else str(item.source_path)
+
+            duplicate_file = DuplicateFile(
+                hostname=self.hostname,
+                md5_hash=hashes['md5'],
+                sha1_hash=hashes['sha1'],
+                sha256_hash=hashes['sha256'],
+                file_path=str(item.source_path),
+                file_name=item.source_path.name,
+                file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
+                master_file_path=master_path,
+                duplicate_count=1,
+                duplicate_type='exact',
+                reason=f"与文件 {master_path} 内容完全相同（Hash一致）"
+            )
+            session.add(duplicate_file)
 
     def _query_source_by_hashes(
         self,

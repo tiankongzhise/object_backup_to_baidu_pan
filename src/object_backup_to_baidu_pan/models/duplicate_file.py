@@ -5,8 +5,8 @@
 
 from datetime import datetime
 from typing import Optional
-from sqlalchemy.orm import mapped_column, Mapped
-from sqlalchemy import BigInteger, String, Integer, DateTime, CHAR, Text
+from sqlalchemy.orm import mapped_column, Mapped, relationship
+from sqlalchemy import BigInteger, String, Integer, DateTime, CHAR, Text, ForeignKey
 from .base import Base
 
 
@@ -26,6 +26,14 @@ class DuplicateFile(Base):
     md5_hash: Mapped[str] = mapped_column(CHAR(32), nullable=False, index=True)
     sha1_hash: Mapped[str] = mapped_column(CHAR(40), nullable=False, index=True)
     sha256_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False, index=True)
+
+    # 关联的主文件（source_files表的记录）
+    master_source_file_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        ForeignKey('source_files.id'),
+        nullable=True,
+        comment='主文件的source_files记录ID'
+    )
 
     # 当前记录的文件信息
     file_path: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
@@ -63,6 +71,7 @@ class DuplicateFile(Base):
             'md5_hash': self.md5_hash,
             'sha1_hash': self.sha1_hash,
             'sha256_hash': self.sha256_hash,
+            'master_source_file_id': self.master_source_file_id,
             'file_path': self.file_path,
             'file_name': self.file_name,
             'file_size': self.file_size,

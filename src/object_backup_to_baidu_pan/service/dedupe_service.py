@@ -153,9 +153,24 @@ class DedupeService:
             item: 当前扫描到的文件/文件夹
             hashes: 当前文件的hash值
             existing_source: 数据库中已存在的相同hash记录
+
+        Returns:
+            bool: 是否成功记录了重复文件
         """
-        # 查找该hash是否已有重复记录
-        existing_dup = session.query(DuplicateFile).filter(
+        # 检查当前文件的路径是否已在重复表中（防止同一文件重复插入）
+        existing_by_path = session.query(DuplicateFile).filter(
+            and_(
+                DuplicateFile.hostname == self.hostname,
+                DuplicateFile.file_path == str(item.source_path)
+            )
+        ).first()
+
+        if existing_by_path:
+            # 该文件已经在重复表中记录过了，跳过
+            return False
+
+        # 查找该hash是否已有重复记录（用于判断主文件）
+        existing_dup_by_hash = session.query(DuplicateFile).filter(
             and_(
                 DuplicateFile.hostname == self.hostname,
                 DuplicateFile.md5_hash == hashes['md5'],
@@ -164,29 +179,31 @@ class DedupeService:
             )
         ).first()
 
-        if existing_dup:
-            # 已存在重复记录，更新
-            existing_dup.duplicate_count += 1
-            existing_dup.reason = f"与文件 {existing_dup.file_path} 内容完全相同（Hash一致）"
-            # 保留第一个文件作为主文件
-        else:
-            # 新建重复记录
-            master_path = existing_source.file_path if existing_source else str(item.source_path)
+        if existing_dup_by_hash:
+            # 已存在该hash的重复记录，只更新计数
+            existing_dup_by_hash.duplicate_count += 1
+            return True
 
-            duplicate_file = DuplicateFile(
-                hostname=self.hostname,
-                md5_hash=hashes['md5'],
-                sha1_hash=hashes['sha1'],
-                sha256_hash=hashes['sha256'],
-                file_path=str(item.source_path),
-                file_name=item.source_path.name,
-                file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
-                master_file_path=master_path,
-                duplicate_count=1,
-                duplicate_type='exact',
-                reason=f"与文件 {master_path} 内容完全相同（Hash一致）"
-            )
-            session.add(duplicate_file)
+        # 新建重复记录
+        master_path = existing_source.file_path if existing_source else str(item.source_path)
+        master_source_file_id = existing_source.id if existing_source else None
+
+        duplicate_file = DuplicateFile(
+            hostname=self.hostname,
+            md5_hash=hashes['md5'],
+            sha1_hash=hashes['sha1'],
+            sha256_hash=hashes['sha256'],
+            master_source_file_id=master_source_file_id,
+            file_path=str(item.source_path),
+            file_name=item.source_path.name,
+            file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
+            master_file_path=master_path,
+            duplicate_count=1,
+            duplicate_type='exact',
+            reason=f"与文件 {master_path} 内容完全相同（Hash一致）"
+        )
+        session.add(duplicate_file)
+        return True
 
     def _query_source_by_hashes(
         self,

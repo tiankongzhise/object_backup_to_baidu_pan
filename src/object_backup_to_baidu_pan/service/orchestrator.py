@@ -289,9 +289,31 @@ class MainOrchestrator:
         with self.db_service.get_session() as session:
             results = self.dedupe_service.compare_and_dedupe(normal_items, session)
 
+        # 删除重复文件（已存在于数据库中的文件不需要再次备份）
+        self._cleanup_duplicate_files(results.already_backup)
+
         self._log(f"去重完成: 待备份 {len(results.to_backup)}, 已备份 {len(results.already_backup)}")
 
         return results
+
+    def _cleanup_duplicate_files(self, duplicate_items: list[DedupeResultItem]):
+        """清理重复文件（已存在于数据库中，无需再次备份）
+
+        Args:
+            duplicate_items: 已备份的项目列表（重复文件）
+        """
+        for item in duplicate_items:
+            try:
+                if item.source_path.exists():
+                    if item.source_path.is_file():
+                        item.source_path.unlink()
+                        self._log(f"已删除重复文件: {item.source_path}")
+                    else:
+                        import shutil
+                        shutil.rmtree(item.source_path)
+                        self._log(f"已删除重复文件夹: {item.source_path}")
+            except Exception as e:
+                self._log(f"删除重复文件失败: {item.source_path}, 错误: {e}")
 
     def _check_manual_review_items(self):
         """检查人工处理项并发送邮件通知"""

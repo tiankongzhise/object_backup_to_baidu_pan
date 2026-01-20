@@ -24,6 +24,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
 from sqlalchemy import and_
+from sqlalchemy.orm import Session
 
 from ..config import Config, SpaceConfig, DatabaseCredentials, DatabasePoolConfig, get_hostname, is_archive_file
 from .database_service import DatabaseService
@@ -39,7 +40,7 @@ from .space_manager import SpaceManager
 from .queue_manager import QueueManager, UploadTask, UploadResult
 from ..models import (
     SourceFile, BackupPackage, ManualReviewItem as ManualReviewItemModel,
-    OperationLog
+    OperationLog, SourceFileAnomaly
 )
 
 
@@ -109,7 +110,19 @@ class MainOrchestrator:
         self._logger = logging.getLogger(__name__)
 
     def run(self):
-        """运行备份流程"""
+        """运行备份流程
+
+        流程：
+        1. 初始化（检查磁盘空间、创建表）
+        2. 扫描+分类
+        3. 保存人工处理项
+        4. 去重比对（包含预处理识别高度可能重复对象）
+        5. 优先处理新文件（to_backup）
+        6. 等待上传完成
+        7. 延后处理高度可能重复对象（highly_likely_duplicate）
+        8. 等待上传完成
+        9. 人工处理检查
+        """
         try:
             self._update_progress(
                 phase='initializing',
@@ -128,17 +141,27 @@ class MainOrchestrator:
             # 4. 保存人工处理项到数据库（只保存，不处理）
             self._save_manual_review_items(scan_results)
 
-            # 5. 去重比对（只处理正常文件/文件夹，跳过ManualReviewItem）
+            # 5. 去重比对（包含预处理识别高度可能重复对象）
             deduplicate_results = self._deduplicate(scan_results)
 
-            # 6. 同步处理（压缩+验证），验证完一个立即提交上传任务
-            self._start_uploader()
-            upload_tasks = self._process_items(deduplicate_results)
+            # 6. 优先处理新文件（to_backup）
+            self._log(f"待备份新文件: {len(deduplicate_results.to_backup)}")
+            if deduplicate_results.to_backup:
+                self._start_uploader()
+                self._process_items(deduplicate_results.to_backup, "新文件")
+                self._wait_for_uploads()
 
-            # 7. 等待上传完成
-            self._wait_for_uploads()
+            # 7. 延后处理高度可能重复对象（highly_likely_duplicate）
+            # 这些对象需要等新文件全部处理完后再处理
+            self._log(f"高度可能重复对象: {len(deduplicate_results.highly_likely_duplicate)}")
+            if deduplicate_results.highly_likely_duplicate:
+                # 重新检查这些对象是否真的已备份
+                self._process_highly_likely_duplicates(deduplicate_results.highly_likely_duplicate)
 
-            # 8. 人工处理检查
+            # 8. 清理已备份的重复文件
+            self._cleanup_duplicate_files(deduplicate_results.already_backup)
+
+            # 9. 人工处理检查
             self._check_manual_review_items()
 
             self._update_progress(
@@ -400,20 +423,24 @@ class MainOrchestrator:
         except Exception as e:
             self._log(f"发送人工处理通知邮件失败: {e}")
 
-    def _process_items(self, dedupe_results: DedupeResult) -> list[UploadTask]:
-        """同步处理所有项目，验证完一个立即提交上传任务
+    def _process_items(self, items: list[DedupeResultItem], item_type: str = "项目") -> list[UploadTask]:
+        """同步处理项目列表，验证完一个立即提交上传任务
 
         流程说明：
         - 对于压缩文件：跳过压缩和验证环节，直接上传
         - 对于普通文件/文件夹：压缩 → 从数据库获取hash验证 → 上传
         - 源文件hash在去重阶段已计算并存入数据库，后续阶段从数据库获取
 
+        Args:
+            items: 项目列表
+            item_type: 项目类型描述（用于日志显示）
+
         注意：不再返回任务列表，而是立即将任务提交到队列
         """
-        total = len(dedupe_results.to_backup)
+        total = len(items)
         self._progress.total_items = total
 
-        for i, item in enumerate(dedupe_results.to_backup):
+        for i, item in enumerate(items):
             self._progress.current_item = str(item.source_path)
             self._progress.completed_items = i
 
@@ -484,6 +511,236 @@ class MainOrchestrator:
                 self._progress.failed_items += 1
 
         return []  # 任务已直接提交到队列，不再返回
+
+    def _process_highly_likely_duplicates(self, items: list[DedupeResultItem]):
+        """处理高度可能重复的对象
+
+        这些对象在预处理阶段被识别为高度可能重复（主机+路径+大小完全一致）
+        处理策略：
+        1. 计算当前文件的hash
+        2. 检查数据库中是否有记录：
+           - is_backup=True + hash一致 → 直接删除（确认已备份）
+           - is_backup=True + hash不一致 → 记录异常 → 发送邮件 → 正常处理
+           - is_backup=False 或无记录 → 正常处理流程
+
+        Args:
+            items: 高度可能重复的项目列表
+        """
+        self._log(f"开始处理 {len(items)} 个高度可能重复对象...")
+
+        anomalies_to_notify: list = []  # 存储需要发送邮件的异常
+
+        for item in items:
+            try:
+                # 查询数据库中该路径的记录
+                with self.db_service.get_session() as session:
+                    source_file = session.query(SourceFile).filter(
+                        and_(
+                            SourceFile.hostname == self.hostname,
+                            SourceFile.file_path == str(item.source_path)
+                        )
+                    ).first()
+
+                    # 计算当前文件的hash
+                    current_hashes = self._recalculate_hash(item)
+
+                    # 判断是否可以直接删除
+                    can_delete_directly = False
+
+                    if source_file and source_file.is_backup:
+                        # 数据库标记已备份，检查hash是否一致
+                        if (current_hashes['md5'] == source_file.md5_hash and
+                            current_hashes['sha1'] == source_file.sha1_hash and
+                            current_hashes['sha256'] == source_file.sha256_hash):
+                            # hash一致，可以直接删除
+                            can_delete_directly = True
+                            self._log(f"文件已确认备份成功，直接删除: {item.source_path}")
+                            self._delete_file(item)
+                        else:
+                            # hash不一致，记录异常
+                            self._log(f"警告: 文件 {item.source_path} 数据库标记已备份，但hash不一致!")
+                            anomaly = self._record_anomaly(
+                                session, item, source_file, current_hashes
+                            )
+                            anomalies_to_notify.append(anomaly)
+
+                    # 如果不能直接删除，走正常处理流程
+                    if not can_delete_directly:
+                        self._log(f"重新处理: {item.source_path}")
+                        self._start_uploader()
+                        self._process_items([item], "重新处理")
+                        self._wait_for_uploads()
+
+            except Exception as e:
+                self._log(f"处理高度可能重复对象失败: {item.source_path}, 错误: {e}")
+
+        # 发送异常通知邮件
+        if anomalies_to_notify:
+            self._send_anomaly_notification(anomalies_to_notify)
+
+    def _delete_file(self, item: DedupeResultItem):
+        """删除文件或文件夹
+
+        Args:
+            item: 文件/文件夹信息
+        """
+        try:
+            if item.source_path.exists():
+                if item.source_path.is_file():
+                    item.source_path.unlink()
+                else:
+                    shutil.rmtree(item.source_path)
+        except Exception as e:
+            self._log(f"删除文件失败: {item.source_path}, 错误: {e}")
+
+    def _recalculate_hash(self, item: DedupeResultItem) -> dict:
+        """重新计算文件hash
+
+        Args:
+            item: 文件/文件夹信息
+
+        Returns:
+            dict: hash值字典
+        """
+        if isinstance(item, FileInfo):
+            return CalculateHashService.calculate_file_hash(
+                item.source_path,
+                self.config.hash.required_hash_algorithms
+            )
+        else:
+            return CalculateHashService.calculate_folder_hash(
+                {
+                    'source_path': str(item.source_path),
+                    'classify_result': item.classify_result.value
+                },
+                self.config.hash.required_hash_algorithms
+            )
+
+    def _record_anomaly(
+        self,
+        session: Session,
+        item: DedupeResultItem,
+        source_file: SourceFile,
+        actual_hashes: dict
+    ) -> SourceFileAnomaly:
+        """记录异常情况到数据库
+
+        Args:
+            session: 数据库会话
+            item: 文件/文件夹信息
+            source_file: 数据库中的源文件记录
+            actual_hashes: 实际计算的文件hash
+
+        Returns:
+            SourceFileAnomaly: 创建的异常记录
+        """
+        anomaly = SourceFileAnomaly(
+            hostname=self.hostname,
+            source_file_id=source_file.id,
+            file_path=str(item.source_path),
+            file_name=item.source_path.name,
+            file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
+            db_md5_hash=source_file.md5_hash,
+            db_sha1_hash=source_file.sha1_hash,
+            db_sha256_hash=source_file.sha256_hash,
+            actual_md5_hash=actual_hashes['md5'],
+            actual_sha1_hash=actual_hashes['sha1'],
+            actual_sha256_hash=actual_hashes['sha256'],
+            anomaly_type='hash_mismatch',
+            description=(
+                f"数据库标记文件已备份 (is_backup=True)，但实际文件hash与数据库记录不一致。\n"
+                f"数据库记录hash: md5={source_file.md5_hash}, sha1={source_file.sha1_hash}\n"
+                f"实际文件hash: md5={actual_hashes['md5']}, sha1={actual_hashes['sha1']}\n"
+                f"这可能表示：1. 文件在备份后被修改；2. 数据库记录被篡改；3. 程序存在bug"
+            ),
+            status='pending',
+            notification_sent=False
+        )
+        session.add(anomaly)
+        session.flush()
+        self._log(f"已记录异常: {item.source_path}")
+        return anomaly
+
+    def _send_anomaly_notification(self, anomalies: list[SourceFileAnomaly]):
+        """发送异常通知邮件给管理员
+
+        Args:
+            anomalies: 异常记录列表
+        """
+        if not anomalies:
+            return
+
+        try:
+            from email.mime.text import MIMEText
+            from email.utils import formataddr
+            import smtplib
+            from ..config import get_smtp_config
+
+            credentials = get_smtp_config()
+            if not credentials:
+                self._log("未配置SMTP，无法发送异常通知邮件")
+                return
+
+            # 构建邮件内容
+            anomaly_count = len(anomalies)
+            html_content = f"""
+            <html>
+            <body>
+                <h2 style="color: red;">备份系统检测到异常情况</h2>
+                <p>检测到 {anomaly_count} 个异常情况，需要管理员人工核验。</p>
+                <table border="1" cellpadding="8" style="border-collapse: collapse;">
+                    <tr>
+                        <th>序号</th>
+                        <th>文件路径</th>
+                        <th>异常类型</th>
+                        <th>数据库MD5</th>
+                        <th>实际MD5</th>
+                    </tr>
+            """
+
+            for i, anomaly in enumerate(anomalies, 1):
+                html_content += f"""
+                    <tr>
+                        <td>{i}</td>
+                        <td>{anomaly.file_path}</td>
+                        <td>{anomaly.anomaly_type}</td>
+                        <td>{anomaly.db_md5_hash[:16]}...</td>
+                        <td>{anomaly.actual_md5_hash[:16]}...</td>
+                    </tr>
+                """
+
+            html_content += """
+                </table>
+                <p>请登录系统查看详情并进行人工核验。</p>
+            </body>
+            </html>
+            """
+
+            msg = MIMEText(html_content, 'html', 'utf-8')
+            msg['Subject'] = f'备份系统异常通知 - {anomaly_count}个异常待处理'
+            msg['From'] = formataddr(['备份系统', credentials.username])
+            msg['To'] = ', '.join(credentials.admin_emails)
+
+            with smtplib.SMTP_SSL(credentials.host, credentials.port) as server:
+                server.login(credentials.username, credentials.password)
+                server.send_message(
+                    msg,
+                    from_addr=credentials.username,
+                    to_addrs=credentials.admin_emails
+                )
+
+            # 更新通知状态
+            with self.db_service.get_session() as session:
+                for anomaly in anomalies:
+                    session.add(anomaly)
+                    anomaly.notification_sent = True
+
+            self._log(f"已发送异常通知邮件，包含 {anomaly_count} 个异常")
+
+        except ImportError as e:
+            self._log(f"导入邮件模块失败，无法发送异常通知: {e}")
+        except Exception as e:
+            self._log(f"发送异常通知邮件失败: {e}")
 
     def _get_source_hashes_from_db(self, item: DedupeResultItem) -> dict | None:
         """从数据库获取源文件hash

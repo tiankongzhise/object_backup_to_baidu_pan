@@ -21,22 +21,39 @@ DedupeResultItem = Union[FileInfo, FolderInfo]
 @dataclass
 class DedupeResult:
     """去重结果"""
-    to_backup: list[DedupeResultItem]  # 需要备份
+    to_backup: list[DedupeResultItem]  # 需要备份（新增文件）
     already_backup: list[DedupeResultItem]  # 已备份，直接删除
+    highly_likely_duplicate: list[DedupeResultItem]  # 高度可能重复（主机+路径+大小完全一致）
     not_found_in_db: list[DedupeResultItem]  # 数据库无记录
 
 
 class DedupeService:
     """去重服务"""
 
-    def __init__(self, hash_config: HashConfig | None = None):
+    def __init__(self, hash_config: HashConfig | None = None, logger = None):
         """初始化去重服务
 
         Args:
             hash_config: Hash配置，如果为None则使用默认配置
+            logger: 日志器，如果为None则使用默认日志器
         """
         self.hash_config = hash_config or HashConfig()
         self.hostname = get_hostname()
+        self._logger = logger
+
+    def _log(self, message: str, level: str = 'info'):
+        """记录日志
+
+        Args:
+            message: 日志消息
+            level: 日志级别 ('debug', 'info', 'warning', 'error')
+        """
+        if self._logger:
+            getattr(self._logger, level)(message)
+        else:
+            import logging
+            logger = logging.getLogger(__name__)
+            getattr(logger, level)(message)
 
     def compare_and_dedupe(
         self,
@@ -45,7 +62,12 @@ class DedupeService:
     ) -> DedupeResult:
         """与数据库比对，进行去重处理
 
-        同时查询 source_files 和 backup_packages（已完成的）进行去重
+        流程：
+        1. 预处理：检查主机+路径+大小是否与数据库已备份文件完全一致
+           - 完全一致 → 高度可能重复对象，延后处理
+           - 不一致 → 继续正常去重流程
+        2. 正常去重：计算hash，与数据库比对
+
         注意：计算出的hash会立即保存到数据库，供后续阶段使用
         重复文件会记录到 duplicate_files 表
 
@@ -58,6 +80,7 @@ class DedupeService:
         """
         to_backup: list[DedupeResultItem] = []
         already_backup: list[DedupeResultItem] = []
+        highly_likely_duplicate: list[DedupeResultItem] = []
         not_found_in_db: list[DedupeResultItem] = []
 
         # 过滤出正常文件/文件夹
@@ -66,7 +89,17 @@ class DedupeService:
             if isinstance(item, (FileInfo, FolderInfo))
         ]
 
+        # 预处理：识别高度可能重复的对象
+        # 检查主机+路径+大小是否与数据库已备份的源文件完全一致
+        prechecked_items = self._precheck_highly_likely_duplicates(normal_items, session)
+
         for item in normal_items:
+            # 检查是否在预处理列表中（高度可能重复）
+            if id(item) in prechecked_items:
+                # 高度可能重复，添加到待处理列表，延后处理
+                highly_likely_duplicate.append(item)
+                continue
+
             # 计算Hash
             if isinstance(item, FileInfo):
                 hashes = CalculateHashService.calculate_file_hash(
@@ -106,8 +139,48 @@ class DedupeService:
         return DedupeResult(
             to_backup=not_found_in_db,
             already_backup=already_backup,
+            highly_likely_duplicate=highly_likely_duplicate,
             not_found_in_db=not_found_in_db,
         )
+
+    def _precheck_highly_likely_duplicates(
+        self,
+        items: list[DedupeResultItem],
+        session: Session
+    ) -> set[int]:
+        """预处理：识别高度可能重复的对象
+
+        检查主机+路径+大小是否与数据库已备份的源文件完全一致
+        如果完全一致，说明这个文件之前已经备份过（可能是同一次任务中断后的重试）
+
+        Args:
+            items: 文件/文件夹列表
+            session: 数据库会话
+
+        Returns:
+            set[int]: 高度可能重复对象的id集合
+        """
+        likely_dup_ids: set[int] = set()
+
+        for item in items:
+            file_size = item.file_size if isinstance(item, FileInfo) else item.total_size
+
+            # 查询是否已有相同主机+路径+大小的已备份记录
+            existing = session.query(SourceFile).filter(
+                and_(
+                    SourceFile.hostname == self.hostname,
+                    SourceFile.file_path == str(item.source_path),
+                    SourceFile.file_size == file_size,
+                    SourceFile.is_backup == True
+                )
+            ).first()
+
+            if existing:
+                # 主机+路径+大小完全一致，高度可能重复
+                likely_dup_ids.add(id(item))
+                self._log(f"预处理识别高度可能重复对象: {item.source_path}")
+
+        return likely_dup_ids
 
     def _save_source_file(self, session: Session, item: DedupeResultItem, hashes: dict):
         """保存源文件信息到数据库

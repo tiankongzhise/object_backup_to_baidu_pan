@@ -9,6 +9,7 @@ from .backup_package import BackupPackage
 from .manual_review_item import ManualReviewItem
 from .operation_log import OperationLog
 from .duplicate_file import DuplicateFile
+from .source_file_anomaly import SourceFileAnomaly
 
 __all__ = [
     'Base',
@@ -17,4 +18,5 @@ __all__ = [
     'ManualReviewItem',
     'OperationLog',
     'DuplicateFile',
+    'SourceFileAnomaly',
 ]

@@ -46,6 +46,7 @@ class DedupeService:
         """与数据库比对，进行去重处理
 
         同时查询 source_files 和 backup_packages（已完成的）进行去重
+        注意：计算出的hash会立即保存到数据库，供后续阶段使用
 
         Args:
             items: 分类后的项目列表
@@ -94,16 +95,51 @@ class DedupeService:
                     existing_source.file_path = str(item.source_path)
             else:
                 # 数据库中不存在，添加到待备份列表
+                # 同时将源文件信息保存到数据库（供后续阶段从数据库获取hash）
+                self._save_source_file(session, item, hashes)
                 not_found_in_db.append(item)
 
-        # 合并 not_found_in_db 到 to_backup
-        to_backup = not_found_in_db
-
         return DedupeResult(
-            to_backup=to_backup,
+            to_backup=not_found_in_db,
             already_backup=already_backup,
             not_found_in_db=not_found_in_db,
         )
+
+    def _save_source_file(self, session: Session, item: DedupeResultItem, hashes: dict):
+        """保存源文件信息到数据库
+
+        Args:
+            session: 数据库会话
+            item: 文件/文件夹信息
+            hashes: 已计算的hash值
+        """
+        # 检查是否已存在
+        existing = session.query(SourceFile).filter(
+            and_(
+                SourceFile.hostname == self.hostname,
+                SourceFile.md5_hash == hashes['md5'],
+                SourceFile.sha1_hash == hashes['sha1'],
+                SourceFile.sha256_hash == hashes['sha256']
+            )
+        ).first()
+
+        if existing:
+            # 更新路径信息
+            existing.file_path = str(item.source_path)
+            existing.file_name = item.source_path.name
+        else:
+            # 新建记录
+            source_file = SourceFile(
+                hostname=self.hostname,
+                file_path=str(item.source_path),
+                file_name=item.source_path.name,
+                file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
+                md5_hash=hashes['md5'],
+                sha1_hash=hashes['sha1'],
+                sha256_hash=hashes['sha256'],
+                is_backup=False,
+            )
+            session.add(source_file)
 
     def _query_source_by_hashes(
         self,

@@ -379,9 +379,13 @@ class MainOrchestrator:
             self._log(f"发送人工处理通知邮件失败: {e}")
 
     def _process_items(self, dedupe_results: DedupeResult) -> list[UploadTask]:
-        """同步处理所有项目（压缩+验证），验证完一个立即提交上传任务
+        """同步处理所有项目，验证完一个立即提交上传任务
 
-        对于已经是压缩文件的源文件，跳过压缩环节，直接上传
+        流程说明：
+        - 对于压缩文件：跳过压缩和验证环节，直接上传
+        - 对于普通文件/文件夹：压缩 → 从数据库获取hash验证 → 上传
+        - 源文件hash在去重阶段已计算并存入数据库，后续阶段从数据库获取
+
         注意：不再返回任务列表，而是立即将任务提交到队列
         """
         total = len(dedupe_results.to_backup)
@@ -392,11 +396,14 @@ class MainOrchestrator:
             self._progress.completed_items = i
 
             try:
-                # 判断是否是已压缩文件（跳过压缩环节）
+                # 判断是否是已压缩文件（跳过压缩和验证环节）
                 is_archive = isinstance(item, FileInfo) and is_archive_file(item.source_path)
 
+                # 从数据库获取源文件hash（去重阶段已保存）
+                source_hashes = self._get_source_hashes_from_db(item)
+
                 if is_archive:
-                    # 已压缩文件，直接使用源文件上传
+                    # 已压缩文件，直接使用源文件上传（跳过压缩和验证）
                     self._update_progress(
                         phase='uploading',
                         current_status=f'正在上传压缩文件 ({i+1}/{total})'
@@ -405,13 +412,17 @@ class MainOrchestrator:
                     self._log(f"源文件已是压缩文件，直接上传: {zip_path}")
 
                     # 记录到数据库（标记为is_source_archive=True）
-                    self._save_package_info(item, zip_path, is_source_archive=True)
+                    self._save_package_info(item, zip_path, is_source_archive=True, source_hashes=source_hashes)
+
+                    # 获取源文件夹名称（用于远端路径）
+                    source_folder_name = item.source_path.parent.name
 
                     # 创建上传任务（密码使用默认密码，源文件可能无密码）
                     task = UploadTask(
                         zip_path=zip_path,
                         password='',  # 源压缩文件可能无密码，设为空
-                        source_path=item.source_path
+                        source_path=item.source_path,
+                        source_folder_name=source_folder_name
                     )
                     self._submit_upload_task(task)
                 else:
@@ -425,16 +436,16 @@ class MainOrchestrator:
                         )
                         zip_path = self._compress_item(item)
 
-                        # 验证
+                        # 验证（从数据库获取源文件hash）
                         self._update_progress(
                             phase='verifying',
                             current_status=f'正在验证 ({i+1}/{total})'
                         )
-                        if not self._verify_item(item, zip_path):
+                        if not self._verify_item(item, zip_path, source_hashes):
                             continue  # 验证失败，重新压缩
 
                         # 记录到数据库
-                        self._save_package_info(item, zip_path, is_source_archive=False)
+                        self._save_package_info(item, zip_path, is_source_archive=False, source_hashes=source_hashes)
 
                         # 创建上传任务并立即提交到队列
                         task = UploadTask(
@@ -452,6 +463,37 @@ class MainOrchestrator:
 
         return []  # 任务已直接提交到队列，不再返回
 
+    def _get_source_hashes_from_db(self, item: DedupeResultItem) -> dict | None:
+        """从数据库获取源文件hash
+
+        注意：去重阶段已将hash保存到数据库，这里从数据库获取
+
+        Args:
+            item: 去重结果项
+
+        Returns:
+            dict: hash值字典，如果获取失败返回None
+        """
+        try:
+            with self.db_service.get_session() as session:
+                source_file = session.query(SourceFile).filter(
+                    and_(
+                        SourceFile.hostname == self.hostname,
+                        SourceFile.file_path == str(item.source_path)
+                    )
+                ).first()
+
+                if source_file:
+                    return {
+                        'md5': source_file.md5_hash,
+                        'sha1': source_file.sha1_hash,
+                        'sha256': source_file.sha256_hash
+                    }
+        except Exception as e:
+            self._log(f"从数据库获取hash失败: {item.source_path}, 错误: {e}")
+
+        return None
+
     def _compress_item(self, item: DedupeResultItem) -> Path:
         """压缩单个项目"""
         password = self.config.source.password or self.config.zip.default_password
@@ -465,14 +507,21 @@ class MainOrchestrator:
 
         return zip_path
 
-    def _verify_item(self, item: DedupeResultItem, zip_path: Path) -> bool:
-        """验证单个压缩包"""
+    def _verify_item(self, item: DedupeResultItem, zip_path: Path, source_hashes: dict | None = None) -> bool:
+        """验证单个压缩包
+
+        Args:
+            item: 去重结果项
+            zip_path: 压缩包路径
+            source_hashes: 源文件hash（如果为None则重新计算）
+        """
         password = self.config.source.password or self.config.zip.default_password
 
         result = self.verify_service.verify_package(
             zip_path=zip_path,
             source_info=item,
-            password=password
+            password=password,
+            source_hashes=source_hashes
         )
 
         if not result.is_valid:
@@ -489,7 +538,7 @@ class MainOrchestrator:
 
         return True
 
-    def _save_package_info(self, item: DedupeResultItem, zip_path: Path, is_source_archive: bool = False):
+    def _save_package_info(self, item: DedupeResultItem, zip_path: Path, is_source_archive: bool = False, source_hashes: dict | None = None):
         """保存压缩包信息到数据库
 
         注意：SourceFile保存源文件的hash（用于去重），BackupPackage保存ZIP的hash（用于完整性验证）
@@ -498,23 +547,25 @@ class MainOrchestrator:
             item: 去重结果项
             zip_path: 压缩包路径
             is_source_archive: 是否是已压缩文件直接上传
+            source_hashes: 源文件hash（如果为None则重新计算）
         """
         password = self.config.source.password or self.config.zip.default_password
 
-        # 计算源文件Hash（用于去重）
-        if isinstance(item, FileInfo):
-            source_hashes = CalculateHashService.calculate_file_hash(
-                item.source_path,
-                self.config.hash.required_hash_algorithms
-            )
-        else:
-            source_hashes = CalculateHashService.calculate_folder_hash(
-                {
-                    'source_path': str(item.source_path),
-                    'classify_result': item.classify_result.value
-                },
-                self.config.hash.required_hash_algorithms
-            )
+        # 如果已传入source_hashes则使用，否则重新计算
+        if source_hashes is None:
+            if isinstance(item, FileInfo):
+                source_hashes = CalculateHashService.calculate_file_hash(
+                    item.source_path,
+                    self.config.hash.required_hash_algorithms
+                )
+            else:
+                source_hashes = CalculateHashService.calculate_folder_hash(
+                    {
+                        'source_path': str(item.source_path),
+                        'classify_result': item.classify_result.value
+                    },
+                    self.config.hash.required_hash_algorithms
+                )
 
         # 计算ZIP Hash（用于BackupPackage）
         zip_hashes = CalculateHashService.calculate_file_hash(
@@ -604,7 +655,15 @@ class MainOrchestrator:
         # 判断是否是源压缩文件（zip_path 和 source_path 相同）
         is_source_archive = result.task.zip_path == result.task.source_path
 
-        # 清理源文件/文件夹
+        # 1. 清理ZIP压缩文件（如果是生成的压缩文件，不是源压缩文件）
+        try:
+            if not is_source_archive and result.task.zip_path.exists():
+                result.task.zip_path.unlink()
+                self._log(f"已清理压缩文件: {result.task.zip_path}")
+        except Exception as e:
+            self._log(f"清理压缩文件失败: {result.task.zip_path}, 错误: {e}")
+
+        # 2. 清理源文件/文件夹
         try:
             if result.task.source_path.exists():
                 if result.task.source_path.is_file():

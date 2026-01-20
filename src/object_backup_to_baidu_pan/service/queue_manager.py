@@ -28,6 +28,7 @@ class UploadTask:
     zip_path: Path
     password: str
     source_path: Path
+    source_folder_name: str = ""  # 源文件夹名称，用于远端路径生成
     retry_count: int = 0
     max_retry: int = 5
     priority: int = 0  # 0=普通, 1=高优先级
@@ -180,7 +181,8 @@ class QueueManager:
             # 执行上传
             upload_service = UploadService(
                 file_path=str(task.zip_path),
-                chunk_size=self.config.chunk_size_mb * 1024 * 1024
+                chunk_size=self.config.chunk_size_mb * 1024 * 1024,
+                source_folder_name=task.source_folder_name
             )
 
             result = upload_service.upload_file(

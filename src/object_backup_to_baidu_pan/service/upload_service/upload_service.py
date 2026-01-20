@@ -99,7 +99,7 @@ def _is_network_error(exception: Exception) -> bool:
 
 
 class UploadService:
-    def __init__(self, file_path:str|Path = '',chunk_size: int = 20*1024*1024, rtype: int = 1,env_path:str|Path ='upload.env',temp_dir:str|Path|None = None):
+    def __init__(self, file_path:str|Path = '',chunk_size: int = 20*1024*1024, rtype: int = 1,env_path:str|Path ='upload.env',temp_dir:str|Path|None = None, source_folder_name:str = ''):
         self.file_path = Path(file_path)
         self.remote_path:str = None # type: ignore
         self.chunk_size:int = chunk_size
@@ -110,6 +110,7 @@ class UploadService:
         self.upload_id:str = None # type: ignore
         self.temp_dir = temp_dir
         self.tmp_list:list[Path] = None # type: ignore
+        self.source_folder_name = source_folder_name  # 源文件夹名称
         oauthtoken_refreshtoken()
         self.load_env(env_path)
 
@@ -122,6 +123,9 @@ class UploadService:
     def _set_remote_path(self):
         """设置远程路径，格式遵循PRD规范:
         {百度云盘指定目录}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
+
+        如果传入了 source_folder_name（对于已压缩的源文件），优先使用它来确定远端路径。
+        否则从本地ZIP路径解析。
         """
         # 从本地ZIP路径提取日期和密码
         date, password = extract_date_and_password_from_path(self.file_path.absolute().as_posix())
@@ -131,19 +135,23 @@ class UploadService:
             print(f"upload info Password is missing, please check your file path:{self.file_path}, use unknown instead")
             password = "unknown"
 
-        # 从本地路径提取源文件夹名
-        # 本地路径格式: {compress_dir}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
-        path_parts = self.file_path.parent.parts
-        source_folder_name = None
-        for index, part in enumerate(reversed(path_parts)):
-            # 跳过日期和压缩根目录，找到源文件夹名
-            if re.match(r'^\d{8}$', part):
-                if index +1 <= len(path_parts):
-                    source_folder_name = path_parts[index + 1]
-                    break
+        # 优先使用传入的源文件夹名称（对于已压缩的源文件）
+        if self.source_folder_name:
+            source_folder_name = self.source_folder_name
+        else:
+            # 从本地路径提取源文件夹名
+            # 本地路径格式: {compress_dir}/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
+            path_parts = self.file_path.parent.parts
+            source_folder_name = None
+            for index, part in enumerate(reversed(path_parts)):
+                # 跳过日期和压缩根目录，找到源文件夹名
+                if re.match(r'^\d{8}$', part):
+                    if index +1 <= len(path_parts):
+                        source_folder_name = path_parts[index + 1]
+                        break
 
-        if not source_folder_name:
-            source_folder_name = "unknown"
+            if not source_folder_name:
+                source_folder_name = "unknown"
 
         # 构建远程路径: /item_backup/YYYYMMDD/{源文件夹名}/解压密码_{password}/{文件名}.zip
         self.remote_path = f"/item_backup/{date}/{source_folder_name}/解压密码_{password}/{self.file_path.name}"

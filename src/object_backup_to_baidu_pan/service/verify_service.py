@@ -50,7 +50,8 @@ class VerifyService:
         self,
         zip_path: Path,
         source_info: FileInfo | FolderInfo,
-        password: str | None = None
+        password: str | None = None,
+        source_hashes: Optional[dict] = None
     ) -> VerifyResult:
         """验证ZIP压缩包
 
@@ -58,6 +59,7 @@ class VerifyService:
             zip_path: ZIP文件路径
             source_info: 源文件/文件夹信息
             password: ZIP解压密码
+            source_hashes: 源文件的hash值（如果为None则重新计算，用于节省计算资源）
 
         Returns:
             VerifyResult: 验证结果
@@ -78,19 +80,23 @@ class VerifyService:
                     extracted_path,
                     self.hash_config.required_hash_algorithms
                 )
-                source_hashes = CalculateHashService.calculate_file_hash(
-                    source_info.source_path,
-                    self.hash_config.required_hash_algorithms
-                )
+                # 如果已传入source_hashes则使用，否则重新计算
+                if source_hashes is None:
+                    source_hashes = CalculateHashService.calculate_file_hash(
+                        source_info.source_path,
+                        self.hash_config.required_hash_algorithms
+                    )
             else:
                 extracted_hashes = CalculateHashService.calculate_folder_hash(
                     extracted_path,
                     self.hash_config.required_hash_algorithms
                 )
-                source_hashes = CalculateHashService.calculate_folder_hash(
-                    source_info.source_path,
-                    self.hash_config.required_hash_algorithms
-                )
+                # 如果已传入source_hashes则使用，否则重新计算
+                if source_hashes is None:
+                    source_hashes = CalculateHashService.calculate_folder_hash(
+                        source_info.source_path,
+                        self.hash_config.required_hash_algorithms
+                    )
 
             # 3. 比对Hash
             is_valid = self._compare_hashes(extracted_hashes, source_hashes)

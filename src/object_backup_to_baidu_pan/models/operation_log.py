@@ -15,6 +15,9 @@ class OperationLog(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # 主机名称（用于区分不同主机）
+    hostname: Mapped[str] = mapped_column(String(64), nullable=False, default="localhost", index=True)
+
     # 操作信息
     operation_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
@@ -34,6 +37,7 @@ class OperationLog(Base):
         """转换为字典"""
         return {
             'id': self.id,
+            'hostname': self.hostname,
             'operation_type': self.operation_type,
             'file_path': self.file_path,
             'status': self.status,

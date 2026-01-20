@@ -207,6 +207,40 @@ def get_env_bool(key: str, default: bool = False) -> bool:
     return default
 
 
+# 支持的压缩文件扩展名（这些文件会被认为是已压缩文件，跳过压缩环节）
+ARCHIVE_EXTENSIONS = frozenset({
+    '.zip', '.7z', '.rar', '.tar', '.gz', '.bz2', '.xz',
+    '.tgz', '.tbz2', '.txz', '.tar.gz', '.tar.bz2', '.tar.xz',
+    '.zipx', '.apk', '.jar', '.war', '.ear'
+})
+
+
+def get_hostname() -> str:
+    """获取当前主机名称
+
+    Returns:
+        str: 主机名称，如果无法获取则返回 'localhost'
+    """
+    import socket
+    try:
+        return socket.gethostname()
+    except Exception:
+        return 'localhost'
+
+
+def is_archive_file(file_path: Path | str) -> bool:
+    """判断文件是否为压缩文件
+
+    Args:
+        file_path: 文件路径
+
+    Returns:
+        bool: 如果是压缩文件返回True
+    """
+    path = Path(file_path)
+    return path.suffix.lower() in ARCHIVE_EXTENSIONS
+
+
 class DatabaseCredentials:
     """数据库连接凭证（从环境变量读取）"""
 
@@ -267,4 +301,7 @@ __all__ = [
     'get_env',
     'get_env_int',
     'get_env_bool',
+    'get_hostname',
+    'is_archive_file',
+    'ARCHIVE_EXTENSIONS',
 ]

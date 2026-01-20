@@ -16,8 +16,11 @@ class ManualReviewItem(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
+    # 主机名称（用于区分不同主机）
+    hostname: Mapped[str] = mapped_column(String(64), nullable=False, default="localhost", index=True)
+
     # 文件路径信息
-    file_path: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     file_size: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     file_count: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
@@ -41,6 +44,7 @@ class ManualReviewItem(Base):
         """转换为字典"""
         return {
             'id': self.id,
+            'hostname': self.hostname,
             'file_path': self.file_path,
             'file_size': self.file_size,
             'file_count': self.file_count,

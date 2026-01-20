@@ -4,9 +4,10 @@
 
 流程说明：
 1. 文件扫描分类 → 标记人工处理项到DB，只处理正常项
-2. 去重比对 → 计算Hash，与DB比对
+2. 去重比对 → 计算Hash，与DB比对（包括已完成的backup_packages）
 3. 启动上传队列，并发处理每个项目：
    - 压缩+验证 → 立即提交上传任务到队列（异步上传）
+   - 已压缩文件直接上传，跳过压缩环节
    - 后续项目继续压缩+验证，与上传并发执行
 4. 等待所有上传任务完成
 5. 人工处理检查 → 流程结束后检查是否有pending的人工处理项，发送邮件通知
@@ -22,8 +23,9 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from sqlalchemy import and_
 
-from ..config import Config, SpaceConfig, DatabaseCredentials, DatabasePoolConfig
+from ..config import Config, SpaceConfig, DatabaseCredentials, DatabasePoolConfig, get_hostname, is_archive_file
 from .database_service import DatabaseService
 from .classify_service import (
     ClassifyService, FileInfo, FolderInfo,
@@ -81,6 +83,7 @@ class MainOrchestrator:
         self.config = config
         self.credentials = credentials or DatabaseCredentials()
         self.pool_config = pool_config or DatabasePoolConfig()
+        self.hostname = get_hostname()  # 获取主机名称
 
         # 创建数据库服务
         self.db_service = DatabaseService(self.credentials, self.pool_config)
@@ -226,9 +229,12 @@ class MainOrchestrator:
 
         with self.db_service.get_session() as session:
             for item in manual_items:
-                # 检查是否已存在
+                # 检查是否已存在（按主机名和路径查询）
                 existing = session.query(ManualReviewItemModel).filter(
-                    ManualReviewItemModel.file_path == str(item.source_path)
+                    and_(
+                        ManualReviewItemModel.hostname == self.hostname,
+                        ManualReviewItemModel.file_path == str(item.source_path)
+                    )
                 ).first()
 
                 if existing:
@@ -238,6 +244,7 @@ class MainOrchestrator:
                 else:
                     # 新建记录
                     review_item = ManualReviewItemModel(
+                        hostname=self.hostname,
                         file_path=str(item.source_path),
                         file_size=item.file_size,
                         file_count=item.file_count,
@@ -374,6 +381,7 @@ class MainOrchestrator:
     def _process_items(self, dedupe_results: DedupeResult) -> list[UploadTask]:
         """同步处理所有项目（压缩+验证），验证完一个立即提交上传任务
 
+        对于已经是压缩文件的源文件，跳过压缩环节，直接上传
         注意：不再返回任务列表，而是立即将任务提交到队列
         """
         total = len(dedupe_results.to_backup)
@@ -384,35 +392,59 @@ class MainOrchestrator:
             self._progress.completed_items = i
 
             try:
-                # 预留空间
-                with self.space_manager.reserve_space(item, self.config.storage.compress_dir):
-                    # 压缩
+                # 判断是否是已压缩文件（跳过压缩环节）
+                is_archive = isinstance(item, FileInfo) and is_archive_file(item.source_path)
+
+                if is_archive:
+                    # 已压缩文件，直接使用源文件上传
                     self._update_progress(
-                        phase='compressing',
-                        current_status=f'正在压缩 ({i+1}/{total})'
+                        phase='uploading',
+                        current_status=f'正在上传压缩文件 ({i+1}/{total})'
                     )
-                    zip_path = self._compress_item(item)
+                    zip_path = item.source_path  # 直接使用源文件
+                    self._log(f"源文件已是压缩文件，直接上传: {zip_path}")
 
-                    # 验证
-                    self._update_progress(
-                        phase='verifying',
-                        current_status=f'正在验证 ({i+1}/{total})'
-                    )
-                    if not self._verify_item(item, zip_path):
-                        continue  # 验证失败，重新压缩
+                    # 记录到数据库（标记为is_source_archive=True）
+                    self._save_package_info(item, zip_path, is_source_archive=True)
 
-                    # 记录到数据库
-                    self._save_package_info(item, zip_path)
-
-                    # 创建上传任务并立即提交到队列
+                    # 创建上传任务（密码使用默认密码，源文件可能无密码）
                     task = UploadTask(
                         zip_path=zip_path,
-                        password=self.config.zip.default_password,
+                        password='',  # 源压缩文件可能无密码，设为空
                         source_path=item.source_path
                     )
                     self._submit_upload_task(task)
+                else:
+                    # 普通文件/文件夹，需要压缩
+                    # 预留空间
+                    with self.space_manager.reserve_space(item, self.config.storage.compress_dir):
+                        # 压缩
+                        self._update_progress(
+                            phase='compressing',
+                            current_status=f'正在压缩 ({i+1}/{total})'
+                        )
+                        zip_path = self._compress_item(item)
 
-                    self._progress.completed_items += 1
+                        # 验证
+                        self._update_progress(
+                            phase='verifying',
+                            current_status=f'正在验证 ({i+1}/{total})'
+                        )
+                        if not self._verify_item(item, zip_path):
+                            continue  # 验证失败，重新压缩
+
+                        # 记录到数据库
+                        self._save_package_info(item, zip_path, is_source_archive=False)
+
+                        # 创建上传任务并立即提交到队列
+                        task = UploadTask(
+                            zip_path=zip_path,
+                            password=self.config.zip.default_password,
+                            source_path=item.source_path
+                        )
+                        self._submit_upload_task(task)
+
+                self._progress.completed_items += 1
 
             except Exception as e:
                 self._log(f"处理失败: {item.source_path}, 错误: {e}")
@@ -457,10 +489,15 @@ class MainOrchestrator:
 
         return True
 
-    def _save_package_info(self, item: DedupeResultItem, zip_path: Path):
+    def _save_package_info(self, item: DedupeResultItem, zip_path: Path, is_source_archive: bool = False):
         """保存压缩包信息到数据库
 
         注意：SourceFile保存源文件的hash（用于去重），BackupPackage保存ZIP的hash（用于完整性验证）
+
+        Args:
+            item: 去重结果项
+            zip_path: 压缩包路径
+            is_source_archive: 是否是已压缩文件直接上传
         """
         password = self.config.source.password or self.config.zip.default_password
 
@@ -489,6 +526,7 @@ class MainOrchestrator:
             # 保存源文件信息（使用源文件hash，用于去重）
             if isinstance(item, FileInfo):
                 source_file = SourceFile(
+                    hostname=self.hostname,
                     file_path=str(item.source_path),
                     file_name=item.source_path.name,
                     file_size=item.file_size,
@@ -499,6 +537,7 @@ class MainOrchestrator:
                 )
             else:
                 source_file = SourceFile(
+                    hostname=self.hostname,
                     file_path=str(item.source_path),
                     file_name=item.source_path.name,
                     file_size=item.total_size,
@@ -512,15 +551,17 @@ class MainOrchestrator:
 
             # 保存压缩包信息（使用ZIP hash，用于完整性验证）
             package = BackupPackage(
+                hostname=self.hostname,
                 package_path=str(zip_path),
                 source_file_id=source_file.id,
                 md5_hash=zip_hashes['md5'],
                 sha1_hash=zip_hashes['sha1'],
                 sha256_hash=zip_hashes['sha256'],
-                password=password,
+                password=password if not is_source_archive else None,  # 已压缩文件可能无密码
                 file_count=1 if isinstance(item, FileInfo) else item.file_count,
                 package_size=zip_path.stat().st_size,
                 status='pending',
+                is_source_archive=is_source_archive,
             )
             session.add(package)
 
@@ -560,12 +601,8 @@ class MainOrchestrator:
         """上传成功回调"""
         self._log(f"上传成功: {result.task.zip_path}")
 
-        # 清理本地压缩包
-        try:
-            if result.task.zip_path.exists():
-                result.task.zip_path.unlink()
-        except Exception:
-            pass
+        # 判断是否是源压缩文件（zip_path 和 source_path 相同）
+        is_source_archive = result.task.zip_path == result.task.source_path
 
         # 清理源文件/文件夹
         try:
@@ -582,7 +619,10 @@ class MainOrchestrator:
         # 标记源文件为已备份
         with self.db_service.get_session() as session:
             source_file = session.query(SourceFile).filter(
-                SourceFile.file_path == str(result.task.source_path)
+                and_(
+                    SourceFile.hostname == self.hostname,
+                    SourceFile.file_path == str(result.task.source_path)
+                )
             ).first()
 
             if source_file:

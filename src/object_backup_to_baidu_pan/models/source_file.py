@@ -15,7 +15,12 @@ class SourceFile(Base):
     __tablename__ = 'source_files'
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    file_path: Mapped[str] = mapped_column(String(500), unique=True, nullable=False, index=True)
+
+    # 主机名称（用于区分不同主机）
+    hostname: Mapped[str] = mapped_column(String(64), nullable=False, default="localhost", index=True)
+
+    # 文件路径
+    file_path: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
@@ -39,6 +44,7 @@ class SourceFile(Base):
         """转换为字典"""
         return {
             'id': self.id,
+            'hostname': self.hostname,
             'file_path': self.file_path,
             'file_name': self.file_name,
             'file_size': self.file_size,

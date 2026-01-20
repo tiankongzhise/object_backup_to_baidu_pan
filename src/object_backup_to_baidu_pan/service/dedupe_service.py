@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from .classify_service import FileInfo, FolderInfo, ManualReviewItem, ClassifyResult, ScanResult
 from .hash_service import CalculateHashService
-from ..config import HashConfig
-from ..models import SourceFile
+from ..config import HashConfig, get_hostname
+from ..models import SourceFile, BackupPackage
 
 
 # 去重结果
@@ -36,6 +36,7 @@ class DedupeService:
             hash_config: Hash配置，如果为None则使用默认配置
         """
         self.hash_config = hash_config or HashConfig()
+        self.hostname = get_hostname()
 
     def compare_and_dedupe(
         self,
@@ -43,6 +44,8 @@ class DedupeService:
         session: Session
     ) -> DedupeResult:
         """与数据库比对，进行去重处理
+
+        同时查询 source_files 和 backup_packages（已完成的）进行去重
 
         Args:
             items: 分类后的项目列表
@@ -78,22 +81,20 @@ class DedupeService:
                     self.hash_config.required_hash_algorithms
                 )
 
-            # 查询数据库
-            existing = self._query_by_hashes(session, hashes)
+            # 同时查询 source_files 和 backup_packages（已完成上传的）
+            existing_source = self._query_source_by_hashes(session, hashes)
+            existing_package = self._query_completed_package_by_hashes(session, hashes)
 
-            if existing:
-                # 已存在相同Hash的记录，标记为已备份
+            if existing_source or existing_package:
+                # 任意一个存在相同Hash的记录，标记为已备份
                 already_backup.append(item)
 
-                # 更新数据库中的文件路径（如果不同）
-                if existing.file_path != str(item.source_path):
-                    existing.file_path = str(item.source_path)
+                # 更新 source_files 中的文件路径（如果不同）
+                if existing_source and existing_source.file_path != str(item.source_path):
+                    existing_source.file_path = str(item.source_path)
             else:
                 # 数据库中不存在，添加到待备份列表
-                if isinstance(item, FolderInfo):
-                    not_found_in_db.append(item)
-                else:
-                    not_found_in_db.append(item)
+                not_found_in_db.append(item)
 
         # 合并 not_found_in_db 到 to_backup
         to_backup = not_found_in_db
@@ -104,12 +105,12 @@ class DedupeService:
             not_found_in_db=not_found_in_db,
         )
 
-    def _query_by_hashes(
+    def _query_source_by_hashes(
         self,
         session: Session,
         hashes: dict
     ) -> Optional[SourceFile]:
-        """根据Hash值查询数据库
+        """根据Hash值查询 source_files 表
 
         Args:
             session: 数据库会话
@@ -120,9 +121,34 @@ class DedupeService:
         """
         return session.query(SourceFile).filter(
             and_(
+                SourceFile.hostname == self.hostname,
                 SourceFile.md5_hash == hashes['md5'],
                 SourceFile.sha1_hash == hashes['sha1'],
                 SourceFile.sha256_hash == hashes['sha256']
+            )
+        ).first()
+
+    def _query_completed_package_by_hashes(
+        self,
+        session: Session,
+        hashes: dict
+    ) -> Optional[BackupPackage]:
+        """根据Hash值查询 backup_packages 表（仅已完成的）
+
+        Args:
+            session: 数据库会话
+            hashes: Hash值字典
+
+        Returns:
+            BackupPackage | None: 匹配的已上传完成的记录，不存在返回None
+        """
+        return session.query(BackupPackage).filter(
+            and_(
+                BackupPackage.hostname == self.hostname,
+                BackupPackage.status == 'completed',
+                BackupPackage.md5_hash == hashes['md5'],
+                BackupPackage.sha1_hash == hashes['sha1'],
+                BackupPackage.sha256_hash == hashes['sha256']
             )
         ).first()
 
@@ -152,6 +178,7 @@ class DedupeService:
 
             # 创建记录
             source_file = SourceFile(
+                hostname=self.hostname,
                 file_path=str(item.source_path),
                 file_name=item.source_path.name,
                 file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
@@ -187,7 +214,7 @@ class DedupeService:
             )
 
         # 查找并更新
-        existing = self._query_by_hashes(session, hashes)
+        existing = self._query_source_by_hashes(session, hashes)
         if existing:
             existing.is_backup = True
             from datetime import datetime

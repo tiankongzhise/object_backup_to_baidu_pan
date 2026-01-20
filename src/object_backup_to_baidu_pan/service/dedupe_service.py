@@ -83,12 +83,11 @@ class DedupeService:
                     self.hash_config.required_hash_algorithms
                 )
 
-            # 同时查询 source_files 和 backup_packages（已完成上传的）
+            # 查询已备份的 source_files（is_backup=True）
             existing_source = self._query_source_by_hashes(session, hashes)
-            existing_package = self._query_completed_package_by_hashes(session, hashes)
 
-            if existing_source or existing_package:
-                # 任意一个存在相同Hash的记录，标记为已备份
+            if existing_source:
+                # 已有相同Hash且 is_backup=True 的记录，认定已备份成功
                 already_backup.append(item)
 
                 # 更新 source_files 中的文件路径（如果不同）
@@ -210,21 +209,24 @@ class DedupeService:
         session: Session,
         hashes: dict
     ) -> Optional[SourceFile]:
-        """根据Hash值查询 source_files 表
+        """根据Hash值查询 source_files 表（仅查询已备份的记录）
+
+        注意：只有 is_backup=True 的记录才认定已备份成功
 
         Args:
             session: 数据库会话
             hashes: Hash值字典
 
         Returns:
-            SourceFile | None: 匹配的记录，不存在返回None
+            SourceFile | None: 匹配且已备份的记录，不存在返回None
         """
         return session.query(SourceFile).filter(
             and_(
                 SourceFile.hostname == self.hostname,
                 SourceFile.md5_hash == hashes['md5'],
                 SourceFile.sha1_hash == hashes['sha1'],
-                SourceFile.sha256_hash == hashes['sha256']
+                SourceFile.sha256_hash == hashes['sha256'],
+                SourceFile.is_backup == True  # 只有已备份的才认定成功
             )
         ).first()
 

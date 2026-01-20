@@ -83,7 +83,8 @@ class SpaceConfig:
 @dataclass
 class SourceConfig:
     """源文件夹配置（非敏感）"""
-    path: Path = Path('')
+    paths: list[Path] = field(default_factory=list)  # 多源路径列表
+    path: Path = Path('')  # 兼容单个路径
     password: str = ''  # ZIP加密密码，从环境变量读取更安全
 
 
@@ -115,9 +116,19 @@ class Config:
         config = cls()
 
         if 'source' in data:
+            source_data = data['source']
+            # 支持多路径 paths 和兼容单路径 path
+            paths = source_data.get('paths', [])
+            if isinstance(paths, str):
+                # 如果是字符串，转换为列表
+                paths = [paths] if paths else []
+            path_str = source_data.get('path', '')
+            single_path = Path(path_str) if path_str else Path('')
+
             config.source = SourceConfig(
-                path=Path(data['source'].get('path', '')),
-                password=data['source'].get('password', ''),
+                paths=[Path(p) for p in paths],
+                path=single_path,  # 兼容单个路径
+                password=source_data.get('password', ''),
             )
 
         if 'storage' in data:

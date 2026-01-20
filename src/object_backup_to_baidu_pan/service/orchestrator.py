@@ -109,7 +109,19 @@ class MainOrchestrator:
         self._logger = logging.getLogger(__name__)
 
     def run(self):
-        """运行备份流程"""
+        """运行备份流程（流处理模式）
+
+        流程：
+        1. 检查磁盘空间
+        2. 创建数据库表
+        3. 遍历每个源路径，逐个对象处理：
+           - 扫描分类
+           - 保存人工处理项
+           - 去重检查
+           - 压缩/验证/上传（单个对象完整流程）
+        4. 等待上传完成
+        5. 人工处理检查
+        """
         try:
             self._update_progress(
                 phase='initializing',
@@ -122,23 +134,23 @@ class MainOrchestrator:
             # 2. 创建数据库表
             self.db_service.create_tables()
 
-            # 3. 扫描源文件夹并进行分类
-            scan_results = self._scan_and_classify()
+            # 3. 获取源路径列表（支持多路径）
+            source_paths = self._get_source_paths()
+            if not source_paths:
+                self._log("没有配置源路径")
+                return
 
-            # 4. 保存人工处理项到数据库（只保存，不处理）
-            self._save_manual_review_items(scan_results)
-
-            # 5. 去重比对（只处理正常文件/文件夹，跳过ManualReviewItem）
-            deduplicate_results = self._deduplicate(scan_results)
-
-            # 6. 同步处理（压缩+验证），验证完一个立即提交上传任务
+            # 4. 启动上传队列
             self._start_uploader()
-            upload_tasks = self._process_items(deduplicate_results)
 
-            # 7. 等待上传完成
+            # 5. 遍历每个源路径，流处理每个对象
+            for source_path in source_paths:
+                self._process_source_path(source_path)
+
+            # 6. 等待上传完成
             self._wait_for_uploads()
 
-            # 8. 人工处理检查
+            # 7. 人工处理检查
             self._check_manual_review_items()
 
             self._update_progress(
@@ -155,6 +167,173 @@ class MainOrchestrator:
             )
             raise
 
+    def _get_source_paths(self) -> list[Path]:
+        """获取源路径列表
+
+        优先使用 paths 字段，兼容单个 path 字段
+
+        Returns:
+            list[Path]: 源路径列表
+        """
+        paths = []
+        if self.config.source.paths:
+            paths = [p for p in self.config.source.paths if p and p.exists()]
+        elif self.config.source.path and self.config.source.path.exists():
+            paths = [self.config.source.path]
+        return paths
+
+    def _process_source_path(self, source_path: Path):
+        """处理单个源路径（流处理模式）
+
+        对源路径下的每个项目：
+        1. 扫描分类
+        2. 保存人工处理项
+        3. 去重检查
+        4. 压缩 → 验证 → 上传
+
+        Args:
+            source_path: 源路径
+        """
+        self._log(f"处理源路径: {source_path}")
+
+        # 1. 扫描并分类
+        scan_results = self._scan_source_folder(source_path)
+
+        # 2. 保存人工处理项
+        self._save_manual_review_items(scan_results)
+
+        # 3. 逐个对象流处理
+        for item in scan_results:
+            if isinstance(item, ManualReviewItem):
+                # 人工处理项已保存，跳过
+                continue
+
+            # 流处理单个对象：去重 → 压缩 → 验证 → 上传
+            self._process_single_item(item)
+
+    def _process_single_item(self, item: DedupeResultItem):
+        """流处理单个对象
+
+        流程：去重检查 → 压缩 → 验证 → 上传
+
+        Args:
+            item: 文件或文件夹信息
+        """
+        self._progress.current_item = str(item.source_path)
+
+        try:
+            # 1. 去重检查
+            is_duplicate, existing_source = self._check_duplicate(item)
+
+            if is_duplicate and existing_source:
+                # 已备份，清理重复文件
+                self._log(f"文件已备份，清理: {item.source_path}")
+                self._cleanup_duplicate(item)
+                self._progress.completed_items += 1
+                return
+
+            # 2. 判断是否是已压缩文件
+            is_archive = isinstance(item, FileInfo) and is_archive_file(item.source_path)
+
+            if is_archive:
+                # 已压缩文件，直接上传
+                self._upload_archive_direct(item)
+            else:
+                # 普通文件/文件夹：压缩 → 验证 → 上传
+                self._compress_verify_upload(item)
+
+            self._progress.completed_items += 1
+
+        except Exception as e:
+            self._log(f"处理失败: {item.source_path}, 错误: {e}")
+            self._progress.failed_items += 1
+
+    def _check_duplicate(self, item: DedupeResultItem) -> tuple[bool, Optional[SourceFile]]:
+        """检查文件是否已备份
+
+        Args:
+            item: 文件/文件夹信息
+
+        Returns:
+            tuple[is_duplicate, existing_source]: (是否重复, 已存在的源文件记录)
+        """
+        # 计算Hash
+        hashes = self._calculate_hashes(item)
+
+        with self.db_service.get_session() as session:
+            # 保存源文件信息（Hash）
+            self._save_source_file(session, item, hashes)
+
+            # 查询已备份记录
+            existing_source = self.dedupe_service._query_source_by_hashes(session, hashes)
+
+            if existing_source:
+                return True, existing_source
+            return False, None
+
+    def _calculate_hashes(self, item: DedupeResultItem) -> dict:
+        """计算文件/文件夹Hash
+
+        Args:
+            item: 文件/文件夹信息
+
+        Returns:
+            dict: Hash值字典
+        """
+        from .hash_service import CalculateHashService
+
+        if isinstance(item, FileInfo):
+            return CalculateHashService.calculate_file_hash(
+                item.source_path,
+                self.config.hash.required_hash_algorithms
+            )
+        else:
+            return CalculateHashService.calculate_folder_hash(
+                {
+                    'source_path': str(item.source_path),
+                    'classify_result': item.classify_result.value
+                },
+                self.config.hash.required_hash_algorithms
+            )
+
+    def _save_source_file(self, session, item: DedupeResultItem, hashes: dict):
+        """保存源文件信息到数据库
+
+        Args:
+            session: 数据库会话
+            item: 文件/文件夹信息
+            hashes: Hash值字典
+        """
+        from ..models import SourceFile
+
+        # 检查是否已存在
+        existing = session.query(SourceFile).filter(
+            and_(
+                SourceFile.hostname == self.hostname,
+                SourceFile.md5_hash == hashes['md5'],
+                SourceFile.sha1_hash == hashes['sha1'],
+                SourceFile.sha256_hash == hashes['sha256']
+            )
+        ).first()
+
+        if existing:
+            # 更新路径信息
+            existing.file_path = str(item.source_path)
+            existing.file_name = item.source_path.name
+        else:
+            # 新建记录
+            source_file = SourceFile(
+                hostname=self.hostname,
+                file_path=str(item.source_path),
+                file_name=item.source_path.name,
+                file_size=item.file_size if isinstance(item, FileInfo) else item.total_size,
+                md5_hash=hashes['md5'],
+                sha1_hash=hashes['sha1'],
+                sha256_hash=hashes['sha256'],
+                is_backup=False,
+            )
+            session.add(source_file)
+
     def _check_disk_space(self):
         """检查磁盘空间"""
         self._update_progress(
@@ -163,40 +342,20 @@ class MainOrchestrator:
         )
         self.space_manager.check_initial_space(self.config.storage.compress_dir)
 
-    def _scan_source(self) -> list[ScanResult]:
-        """扫描源文件夹"""
-        self._update_progress(
-            phase='scanning',
-            current_status='正在扫描源文件夹...'
-        )
+    def _scan_source_folder(self, source_path: Path) -> list[ScanResult]:
+        """扫描单个源文件夹
 
-        source_path = self.config.source.path
-        self._log(f"扫描源文件夹: {source_path}")
-
-        results = self.classify_service.scan_source_folder(source_path)
-
-        # 统计
-        normal_count = sum(1 for r in results if isinstance(r, (FileInfo, FolderInfo)))
-        manual_count = sum(1 for r in results if isinstance(r, ManualReviewItem))
-
-        self._log(f"扫描完成: 正常项目 {normal_count}, 需人工处理 {manual_count}")
-
-        return results
-
-    def _scan_and_classify(self) -> list[ScanResult]:
-        """扫描源文件夹并进行分类
-
-        流程：扫描 → 分类检查 → 分离正常项和需人工处理项
+        Args:
+            source_path: 源文件夹路径
 
         Returns:
-            list[ScanResult]: 分类后的结果列表
+            list[ScanResult]: 分类后的项目列表
         """
         self._update_progress(
             phase='scanning',
-            current_status='正在扫描并分类...'
+            current_status=f'正在扫描: {source_path}'
         )
 
-        source_path = self.config.source.path
         self._log(f"扫描源文件夹: {source_path}")
 
         results = self.classify_service.scan_source_folder(source_path)
@@ -208,6 +367,150 @@ class MainOrchestrator:
         self._log(f"扫描完成: 正常项目 {normal_count}, 需人工处理 {manual_count}")
 
         return results
+
+    def _upload_archive_direct(self, item: DedupeResultItem):
+        """直接上传已压缩文件（跳过压缩和验证环节）
+
+        Args:
+            item: 文件信息
+        """
+        self._update_progress(
+            phase='uploading',
+            current_status=f'正在上传: {item.source_path.name}'
+        )
+        self._log(f"源文件已是压缩文件，直接上传: {item.source_path}")
+
+        # 记录到数据库
+        self._save_package_info_direct(item)
+
+        # 创建上传任务
+        task = UploadTask(
+            zip_path=item.source_path,
+            password='',  # 源压缩文件可能无密码
+            source_path=item.source_path,
+            source_folder_name=item.source_path.parent.name
+        )
+        self._submit_upload_task(task)
+
+    def _compress_verify_upload(self, item: DedupeResultItem):
+        """压缩 → 验证 → 上传
+
+        Args:
+            item: 文件/文件夹信息
+        """
+        # 1. 压缩
+        self._update_progress(
+            phase='compressing',
+            current_status=f'正在压缩: {item.source_path.name}'
+        )
+        self._log(f"压缩: {item.source_path}")
+
+        with self.space_manager.reserve_space(item, self.config.storage.compress_dir):
+            zip_path = self._compress_item(item)
+
+            # 2. 验证
+            self._update_progress(
+                phase='verifying',
+                current_status=f'正在验证: {zip_path.name}'
+            )
+            if not self._verify_item(item, zip_path):
+                # 验证失败，重新压缩（递归）
+                self._compress_verify_upload(item)
+                return
+
+            # 3. 记录到数据库
+            self._save_package_info(item, zip_path)
+
+            # 4. 上传
+            self._update_progress(
+                phase='uploading',
+                current_status=f'正在上传: {zip_path.name}'
+            )
+
+            task = UploadTask(
+                zip_path=zip_path,
+                password=self.config.zip.default_password,
+                source_path=item.source_path
+            )
+            self._submit_upload_task(task)
+
+    def _cleanup_duplicate(self, item: DedupeResultItem):
+        """清理重复文件（已备份过的）
+
+        Args:
+            item: 文件/文件夹信息
+        """
+        try:
+            if item.source_path.exists():
+                if item.source_path.is_file():
+                    item.source_path.unlink()
+                else:
+                    shutil.rmtree(item.source_path)
+        except Exception as e:
+            self._log(f"删除重复文件失败: {item.source_path}, 错误: {e}")
+
+    def _save_package_info_direct(self, item: DedupeResultItem):
+        """保存已压缩文件信息到数据库（直接上传，跳过压缩环节）
+
+        Args:
+            item: 文件信息（已压缩文件）
+        """
+        from ..models import SourceFile
+
+        with self.db_service.get_session() as session:
+            # 查找已存在的SourceFile记录
+            source_file = session.query(SourceFile).filter(
+                and_(
+                    SourceFile.hostname == self.hostname,
+                    SourceFile.file_path == str(item.source_path)
+                )
+            ).first()
+
+            if source_file:
+                source_file.file_name = item.source_path.name
+                source_file.file_size = item.file_size
+            else:
+                # 获取Hash并创建记录
+                hashes = self._calculate_hashes(item)
+                source_file = SourceFile(
+                    hostname=self.hostname,
+                    file_path=str(item.source_path),
+                    file_name=item.source_path.name,
+                    file_size=item.file_size,
+                    md5_hash=hashes['md5'],
+                    sha1_hash=hashes['sha1'],
+                    sha256_hash=hashes['sha256'],
+                    is_backup=False,
+                )
+                session.add(source_file)
+
+            session.flush()
+
+            # 检查是否已存在相同package_path的记录
+            existing_package = session.query(BackupPackage).filter(
+                BackupPackage.package_path == str(item.source_path)
+            ).first()
+
+            if existing_package:
+                # 已存在记录，更新状态
+                self._log(f"压缩包记录已存在: {item.source_path}")
+                return
+
+            # 计算ZIP Hash（使用源文件hash）
+            package = BackupPackage(
+                hostname=self.hostname,
+                package_path=str(item.source_path),
+                source_file_id=source_file.id,
+                md5_hash=source_file.md5_hash,
+                sha1_hash=source_file.sha1_hash,
+                sha256_hash=source_file.sha256_hash,
+                password=None,  # 源压缩文件可能无密码
+                file_count=1,
+                package_size=item.file_size,
+                status='pending',
+                is_source_archive=True,
+            )
+            session.add(package)
 
     def _save_manual_review_items(self, scan_results: list[ScanResult]):
         """保存人工处理项到数据库
@@ -633,6 +936,15 @@ class MainOrchestrator:
 
             session.flush()
 
+            # 检查是否已存在相同package_path的记录
+            existing_package = session.query(BackupPackage).filter(
+                BackupPackage.package_path == str(zip_path)
+            ).first()
+
+            if existing_package:
+                self._log(f"压缩包记录已存在: {zip_path}")
+                return
+
             # 保存压缩包信息（使用ZIP hash，用于完整性验证）
             package = BackupPackage(
                 hostname=self.hostname,
@@ -656,6 +968,9 @@ class MainOrchestrator:
             current_status='正在上传...'
         )
 
+        # 检查并初始化 oauth 表
+        self._ensure_oauth_table()
+
         # 设置回调
         self.queue_manager.on_success = self._on_upload_success
         self.queue_manager.on_failed = self._on_upload_failed
@@ -663,6 +978,25 @@ class MainOrchestrator:
         # 启动队列
         self.queue_manager.start()
         self._log("上传队列已启动")
+
+    def _ensure_oauth_table(self):
+        """确保 oauth 表存在，如果不存在则初始化"""
+        try:
+            from .upload_service.database.client import OauthDbClient
+            from sqlalchemy import inspect
+
+            client = OauthDbClient()
+            inspector = inspect(client.engine)
+            tables = inspector.get_table_names()
+
+            if 'baidu_pan_oauth' not in tables:
+                self._log("OAuth表不存在，初始化中...")
+                from .upload_service import oauth as oauth_module
+                oauth_module.init_oauth_db()
+                self._log("OAuth表初始化完成")
+        except Exception as e:
+            self._log(f"初始化OAuth表失败: {e}")
+            raise Exception(f"无法初始化OAuth表，请检查配置: {e}")
 
     def _submit_upload_task(self, task: UploadTask):
         """提交上传任务到队列"""

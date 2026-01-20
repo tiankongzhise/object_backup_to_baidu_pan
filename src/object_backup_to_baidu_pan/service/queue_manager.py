@@ -144,7 +144,7 @@ class QueueManager:
                     if self.on_success:
                         self.on_success(result)
                 else:
-                    if result.retry_count < result.task.max_retry:
+                    if result.task.retry_count < result.task.max_retry:
                         # 重试
                         result.task.retry_count += 1
                         self._queue.put(result.task)

@@ -36,7 +36,7 @@ class ZipConfig:
     })
     salt_length: int = 16
     compress_level: int = 0  # 存储模式，不压缩
-    default_password: str = 'backup123'
+    default_password: str = 'H_x123456789'
 
 
 @dataclass

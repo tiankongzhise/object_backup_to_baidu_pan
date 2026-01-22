@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(uv run:*)",
-      "Bash(timeout 30 uv run run.py)"
+      "Bash(timeout 30 uv run run.py)",
+      "Bash(uv add:*)",
+      "Bash(timeout 120 uv run pytest tests/ --tb=no -q)",
+      "Bash(git checkout:*)"
     ]
   }
 }
